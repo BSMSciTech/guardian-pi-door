@@ -12,6 +12,7 @@ import threading
 import time
 from datetime import datetime, timedelta
 from flask import Flask, render_template_string, request, jsonify, redirect, url_for, session, send_file
+from flask_cors import CORS
 from functools import wraps
 import csv
 import io
@@ -31,6 +32,9 @@ except ImportError:
 app = Flask(__name__)
 app.secret_key = 'your-secret-key-change-this-in-production'
 
+# Enable CORS for React frontend
+CORS(app, supports_credentials=True, origins=["http://localhost:5173", "http://127.0.0.1:5173"])
+
 # Hardware configuration
 DOOR_SENSOR_PIN = 17
 GREEN_LED_PIN = 25
@@ -41,7 +45,7 @@ SWITCH_PIN = 24
 # Initialize GPIO components
 if GPIO_AVAILABLE:
     try:
-        door_sensor = Button(DOOR_SENSOR_PIN, pull_up=True)
+        door_sensor = Button(DOOR_SENSOR_PIN, pull_up=False)  # Fixed: pull_up=False for normally closed door sensor
         green_led = LED(GREEN_LED_PIN)
         red_led = LED(RED_LED_PIN)
         white_led = LED(WHITE_LED_PIN)
@@ -294,12 +298,12 @@ def reset_system():
 
 # Door sensor monitoring
 def monitor_door():
-    """Monitor door sensor with proper state management"""
+    """Monitor door sensor with CORRECT logic for normally closed sensor"""
     def door_opened():
         try:
             system_state.door_open = True
             system_state.save_state()
-            log_event('DOOR', 'Door opened', severity='WARNING')
+            log_event('DOOR', 'Door opened - Security timer started', severity='WARNING')
             
             if not system_state.alarm_triggered:
                 start_timer()
@@ -310,13 +314,14 @@ def monitor_door():
         try:
             system_state.door_open = False
             system_state.save_state()
-            log_event('DOOR', 'Door closed', severity='INFO')
+            log_event('DOOR', 'Door closed - Access secured', severity='INFO')
         except Exception as e:
             log_event('SYSTEM', f'Door close handler error: {str(e)}', severity='ERROR')
     
     if GPIO_AVAILABLE:
-        door_sensor.when_pressed = door_opened
-        door_sensor.when_released = door_closed
+        # For normally closed door sensor: when_released = door opened, when_pressed = door closed
+        door_sensor.when_released = door_opened  # Door opens when sensor releases
+        door_sensor.when_pressed = door_closed   # Door closes when sensor presses
 
 # Web routes
 @app.route('/')
@@ -352,15 +357,15 @@ def login():
                 conn.close()
                 
                 log_event('AUTH', f'User login successful', user_id=user[0], severity='INFO')
-                return redirect(url_for('dashboard'))
+                return jsonify({'success': True, 'message': 'Login successful'})
             else:
                 log_event('AUTH', f'Failed login attempt for username: {username}', severity='WARNING')
-                return render_template_string(LOGIN_TEMPLATE, error='Invalid credentials')
+                return jsonify({'success': False, 'message': 'Invalid credentials'}), 401
         except Exception as e:
             log_event('SYSTEM', f'Login error: {str(e)}', severity='ERROR')
-            return render_template_string(LOGIN_TEMPLATE, error='Login system error')
+            return jsonify({'success': False, 'message': 'Login system error'}), 500
     
-    return render_template_string(LOGIN_TEMPLATE)
+    return jsonify({'success': False, 'message': 'Method not allowed'}), 405
 
 @app.route('/logout')
 def logout():
@@ -1243,7 +1248,8 @@ if __name__ == '__main__':
         monitor_door()
     
     print("🚀 Door Monitoring System Starting...")
-    print(f"🌐 Web Interface: http://localhost:5000")
+    print(f"🌐 Flask API: http://localhost:5000")
+    print(f"🌐 React Frontend: http://localhost:5173")
     print(f"🔧 GPIO Mode: {'Hardware' if GPIO_AVAILABLE else 'Simulation'}")
     print("🔐 Default Login: admin / admin123")
     
