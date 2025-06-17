@@ -1,0 +1,5 @@
+
+Flask==2.3.3
+Werkzeug==2.3.7
+gpiozero==1.6.2
+pygame==2.5.2
