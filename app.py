@@ -1,116 +1,113 @@
-
 #!/usr/bin/env python3
 """
 Raspberry Pi Door Monitoring System
-Complete single-file application with GPIO control, web dashboard, user management, and logging
+Complete single-file application with GPIO control, web dashboard, and monitoring
 """
 
 import os
 import json
 import sqlite3
+import hashlib
 import threading
 import time
-import datetime
-import hashlib
-import zipfile
+from datetime import datetime, timedelta
+from flask import Flask, render_template_string, request, jsonify, redirect, url_for, session, send_file
+from functools import wraps
 import csv
 import io
-from threading import Timer
-from dataclasses import dataclass
-from typing import Optional, Dict, List, Any
+import zipfile
 
-# Flask and web dependencies
-from flask import Flask, render_template_string, request, jsonify, redirect, url_for, session, flash, send_file
-from werkzeug.security import generate_password_hash, check_password_hash
-
-# GPIO control (will work on Raspberry Pi)
+# GPIO setup with fallback for non-Pi systems
 try:
-    from gpiozero import LED, Button, DigitalInputDevice
+    from gpiozero import LED, Button
+    import pygame
     GPIO_AVAILABLE = True
+    pygame.mixer.init()
 except ImportError:
-    print("GPIO not available - running in simulation mode")
+    print("GPIO/Audio not available - running in simulation mode")
     GPIO_AVAILABLE = False
 
-# Audio playback
-try:
-    import pygame
-    pygame.mixer.init()
-    AUDIO_AVAILABLE = True
-except ImportError:
-    print("Audio not available - install pygame for sound")
-    AUDIO_AVAILABLE = False
+# Flask app setup
+app = Flask(__name__)
+app.secret_key = 'your-secret-key-change-this-in-production'
 
-# Configuration
-class Config:
-    SECRET_KEY = 'your-secret-key-change-this'
-    DATABASE = 'door_monitor.db'
-    BACKUP_DIR = 'backups'
-    AUDIO_FILE = 'alarm.wav'  # Place your alarm sound file here
-    
-    # GPIO Pin assignments
-    DOOR_SENSOR_PIN = 17    # GPIO17 (BOARD 11)
-    GREEN_LED_PIN = 25      # GPIO25 (BOARD 22)
-    RED_LED_PIN = 27        # GPIO27 (BOARD 13)  
-    WHITE_LED_PIN = 23      # GPIO23 (BOARD 16)
-    SWITCH_PIN = 24         # GPIO24 (BOARD 18)
+# Hardware configuration
+DOOR_SENSOR_PIN = 17
+GREEN_LED_PIN = 25
+RED_LED_PIN = 27
+WHITE_LED_PIN = 23
+SWITCH_PIN = 24
 
-@dataclass
+# Initialize GPIO components
+if GPIO_AVAILABLE:
+    try:
+        door_sensor = Button(DOOR_SENSOR_PIN, pull_up=True)
+        green_led = LED(GREEN_LED_PIN)
+        red_led = LED(RED_LED_PIN)
+        white_led = LED(WHITE_LED_PIN)
+        green_led.on()  # System running indicator
+    except Exception as e:
+        print(f"GPIO initialization error: {e}")
+        GPIO_AVAILABLE = False
+
+# Global state management
 class SystemState:
-    door_open: bool = False
-    timer_active: bool = False
-    alarm_active: bool = False
-    timer_start_time: Optional[float] = None
-    timer_duration: int = 30  # seconds
-    instant_alarm_mode: bool = False
-    
-class DoorMonitoringSystem:
     def __init__(self):
-        self.state = SystemState()
-        self.load_state()
-        
-        # Initialize GPIO if available
-        if GPIO_AVAILABLE:
-            self.setup_gpio()
-        else:
-            print("Running in simulation mode - GPIO not available")
-            
-        # Initialize database
-        self.init_database()
-        
-        # Timer for alarm
-        self.alarm_timer = None
-        self.red_led_blink_thread = None
+        self.door_open = False
+        self.timer_active = False
+        self.alarm_triggered = False
+        self.timer_start_time = None
+        self.timer_duration = 30  # seconds
+        self.blink_thread = None
         self.stop_blink = False
-        
-        # Schedules (3 windows per day)
-        self.schedules = self.load_schedules()
-        
-    def setup_gpio(self):
-        """Initialize GPIO components"""
+        self.last_scroll_position = 0
+        self.load_state()
+    
+    def save_state(self):
+        """Save persistent state to JSON file"""
+        state_data = {
+            'timer_duration': self.timer_duration,
+            'timer_active': self.timer_active,
+            'timer_start_time': self.timer_start_time.isoformat() if self.timer_start_time else None,
+            'alarm_triggered': self.alarm_triggered,
+            'door_open': self.door_open
+        }
         try:
-            # Fixed: Inverted door sensor logic
-            self.door_sensor = DigitalInputDevice(Config.DOOR_SENSOR_PIN, pull_up=True)
-            self.green_led = LED(Config.GREEN_LED_PIN)
-            self.red_led = LED(Config.RED_LED_PIN)
-            self.white_led = LED(Config.WHITE_LED_PIN)
-            
-            # Fixed: Corrected door sensor callbacks (inverted logic)
-            self.door_sensor.when_deactivated = self.on_door_open  # When pin goes LOW (door opens)
-            self.door_sensor.when_activated = self.on_door_close   # When pin goes HIGH (door closes)
-            
-            # Green LED always on when system running
-            self.green_led.on()
-            
-            # Check initial door state
-            self.state.door_open = not self.door_sensor.is_active  # Inverted logic
-            
-            print("GPIO initialized successfully")
+            with open('system_state.json', 'w') as f:
+                json.dump(state_data, f, indent=2)
         except Exception as e:
-            print(f"GPIO initialization failed: {e}")
-            
-    def init_database(self):
-        """Initialize SQLite database"""
-        conn = sqlite3.connect(Config.DATABASE)
+            print(f"Error saving state: {e}")
+    
+    def load_state(self):
+        """Load persistent state from JSON file"""
+        try:
+            if os.path.exists('system_state.json'):
+                with open('system_state.json', 'r') as f:
+                    state_data = json.load(f)
+                    self.timer_duration = state_data.get('timer_duration', 30)
+                    self.timer_active = state_data.get('timer_active', False)
+                    self.alarm_triggered = state_data.get('alarm_triggered', False)
+                    self.door_open = state_data.get('door_open', False)
+                    
+                    # Restore timer if it was active
+                    if state_data.get('timer_start_time'):
+                        self.timer_start_time = datetime.fromisoformat(state_data['timer_start_time'])
+                        # Check if timer should have expired
+                        if self.timer_active:
+                            elapsed = (datetime.now() - self.timer_start_time).total_seconds()
+                            if elapsed >= self.timer_duration:
+                                self.trigger_alarm()
+        except Exception as e:
+            print(f"Error loading state: {e}")
+
+# Initialize system state
+system_state = SystemState()
+
+# Database setup
+def init_db():
+    """Initialize SQLite database with proper error handling"""
+    try:
+        conn = sqlite3.connect('door_monitor.db')
         cursor = conn.cursor()
         
         # Users table
@@ -119,1386 +116,1053 @@ class DoorMonitoringSystem:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 username TEXT UNIQUE NOT NULL,
                 password_hash TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'User',
                 email TEXT,
                 department TEXT,
                 contact TEXT,
                 reporting_manager TEXT,
-                role TEXT DEFAULT 'User',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_login TIMESTAMP
             )
         ''')
         
-        # Events table
+        # Events table with enhanced logging
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 event_type TEXT NOT NULL,
-                description TEXT,
+                description TEXT NOT NULL,
                 user_id INTEGER,
-                door_id TEXT DEFAULT 'Door-1',
                 severity TEXT DEFAULT 'INFO',
+                additional_data TEXT,
                 FOREIGN KEY (user_id) REFERENCES users (id)
             )
         ''')
         
-        # Create default admin user if not exists
-        cursor.execute("SELECT COUNT(*) FROM users WHERE username = 'admin'")
-        if cursor.fetchone()[0] == 0:
-            admin_hash = generate_password_hash('admin123')
-            cursor.execute('''
-                INSERT INTO users (username, password_hash, email, role)
-                VALUES (?, ?, ?, ?)
-            ''', ('admin', admin_hash, 'admin@example.com', 'Admin'))
-            
+        # Create default admin user
+        admin_hash = hashlib.sha256('admin123'.encode()).hexdigest()
+        cursor.execute('''
+            INSERT OR IGNORE INTO users (username, password_hash, role, email, department)
+            VALUES (?, ?, ?, ?, ?)
+        ''', ('admin', admin_hash, 'Admin', 'admin@doormonitor.local', 'IT'))
+        
         conn.commit()
         conn.close()
+        log_event('SYSTEM', 'Database initialized successfully', severity='INFO')
+    except Exception as e:
+        print(f"Database initialization error: {e}")
+        log_event('SYSTEM', f'Database initialization failed: {str(e)}', severity='ERROR')
+
+# Authentication decorator
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session:
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+def admin_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session:
+            return redirect(url_for('login'))
+        if session.get('role') != 'Admin':
+            return jsonify({'success': False, 'message': 'Admin access required'})
+        return f(*args, **kwargs)
+    return decorated_function
+
+# Event logging with enhanced features
+def log_event(event_type, description, user_id=None, severity='INFO', additional_data=None):
+    """Enhanced event logging with severity levels and additional data"""
+    try:
+        conn = sqlite3.connect('door_monitor.db')
+        cursor = conn.cursor()
         
-    def load_state(self):
-        """Load system state from file"""
-        try:
-            if os.path.exists('system_state.json'):
-                with open('system_state.json', 'r') as f:
-                    data = json.load(f)
-                    self.state.timer_duration = data.get('timer_duration', 30)
-                    self.state.instant_alarm_mode = data.get('instant_alarm_mode', False)
-        except Exception as e:
-            print(f"Error loading state: {e}")
+        if user_id is None and 'user_id' in session:
+            user_id = session['user_id']
             
-    def save_state(self):
-        """Save system state to file"""
-        try:
-            data = {
-                'timer_duration': self.state.timer_duration,
-                'instant_alarm_mode': self.state.instant_alarm_mode,
-                'door_open': self.state.door_open,
-                'timer_active': self.state.timer_active,
-                'alarm_active': self.state.alarm_active
-            }
-            with open('system_state.json', 'w') as f:
-                json.dump(data, f)
-        except Exception as e:
-            print(f"Error saving state: {e}")
-            
-    def load_schedules(self):
-        """Load access schedules"""
-        try:
-            if os.path.exists('schedules.json'):
-                with open('schedules.json', 'r') as f:
-                    return json.load(f)
-        except Exception as e:
-            print(f"Error loading schedules: {e}")
-            
-        # Default schedule
-        return {
-            'weekday': {
-                'morning': {'start': '08:00', 'end': '12:00'},
-                'afternoon': {'start': '13:00', 'end': '17:00'},
-                'evening': {'start': '18:00', 'end': '20:00'}
-            },
-            'weekend': {
-                'morning': {'start': '09:00', 'end': '12:00'},
-                'afternoon': {'start': '13:00', 'end': '16:00'},
-                'evening': {'start': '17:00', 'end': '19:00'}
-            }
-        }
+        cursor.execute('''
+            INSERT INTO events (event_type, description, user_id, severity, additional_data)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (event_type, description, user_id, severity, additional_data))
         
-    def save_schedules(self):
-        """Save access schedules"""
-        try:
-            with open('schedules.json', 'w') as f:
-                json.dump(self.schedules, f)
-        except Exception as e:
-            print(f"Error saving schedules: {e}")
-            
-    def is_access_time(self):
-        """Check if current time is within access windows"""
-        now = datetime.datetime.now()
-        current_time = now.strftime('%H:%M')
-        day_type = 'weekend' if now.weekday() >= 5 else 'weekday'
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Error logging event: {e}")
+
+def start_timer():
+    """Start countdown timer with proper state management"""
+    if not system_state.timer_active and not system_state.alarm_triggered:
+        system_state.timer_active = True
+        system_state.timer_start_time = datetime.now()
+        system_state.save_state()
         
-        schedule_day = self.schedules.get(day_type, {})
+        log_event('TIMER', f'Timer started - Duration: {system_state.timer_duration}s', 
+                 severity='WARNING')
         
-        for window in ['morning', 'afternoon', 'evening']:
-            window_data = schedule_day.get(window, {})
-            start_time = window_data.get('start')
-            end_time = window_data.get('end')
-            
-            if start_time and end_time:
-                if start_time <= current_time <= end_time:
-                    return True
-                    
-        return False
+        # Start blinking red LED
+        start_blink_red_led()
         
-    def on_door_open(self):
-        """Handle door open event"""
-        print("Door opened!")
-        self.state.door_open = True
-        self.log_event('DOOR_OPEN', 'Door was opened', severity='WARNING')
-        
-        if not self.is_access_time():
-            self.log_event('ACCESS_VIOLATION', 'Door opened outside scheduled hours', severity='WARNING')
-            if self.state.instant_alarm_mode:
-                self.trigger_alarm()
-            else:
-                self.start_timer()
-        else:
-            self.log_event('ACCESS_ALLOWED', 'Door access within scheduled hours', severity='INFO')
-            
-        self.save_state()
-        
-    def on_door_close(self):
-        """Handle door close event"""
-        print("Door closed!")
-        self.state.door_open = False
-        self.log_event('DOOR_CLOSE', 'Door was closed', severity='INFO')
-        
-        # Stop timer if running (but don't reset alarm if already triggered)
-        if self.state.timer_active and not self.state.alarm_active:
-            self.stop_timer()
-            
-        self.save_state()
-        
-    def start_timer(self):
-        """Start countdown timer"""
-        if self.state.timer_active:
-            return
-            
-        print(f"Starting timer for {self.state.timer_duration} seconds")
-        self.state.timer_active = True
-        self.state.timer_start_time = time.time()
-        
-        # Start red LED blinking
-        self.start_red_led_blink()
-        
-        # Set alarm timer
-        self.alarm_timer = Timer(self.state.timer_duration, self.on_timer_expire)
-        self.alarm_timer.start()
-        
-        self.log_event('TIMER_START', f'Timer started for {self.state.timer_duration} seconds', severity='WARNING')
-        
-    def stop_timer(self):
-        """Stop countdown timer"""
-        if not self.state.timer_active:
-            return
-            
-        print("Stopping timer")
-        self.state.timer_active = False
-        self.state.timer_start_time = None
-        
-        if self.alarm_timer:
-            self.alarm_timer.cancel()
-            self.alarm_timer = None
-            
-        # Stop red LED blinking
-        self.stop_red_led_blink()
-        
-        self.log_event('TIMER_STOP', 'Timer stopped - door closed in time', severity='INFO')
-        
-    def on_timer_expire(self):
-        """Handle timer expiration"""
-        print("Timer expired - triggering alarm!")
-        self.state.timer_active = False
-        self.trigger_alarm()
-        
-    def trigger_alarm(self):
-        """Trigger alarm system"""
-        print("ALARM TRIGGERED!")
-        self.state.alarm_active = True
-        
-        # Stop red LED blinking and turn on white LED
-        self.stop_red_led_blink()
-        if GPIO_AVAILABLE:
-            self.white_led.on()
-            
-        # Play alarm sound
-        self.play_alarm_sound()
-        
-        self.log_event('ALARM_TRIGGER', 'Security alarm was triggered', severity='CRITICAL')
-        self.save_state()
-        
-    def reset_alarm(self):
-        """Reset alarm system"""
-        print("Resetting alarm")
-        self.state.alarm_active = False
-        self.state.timer_active = False
+        # Start timer countdown in separate thread
+        timer_thread = threading.Thread(target=countdown_timer)
+        timer_thread.daemon = True
+        timer_thread.start()
+
+def countdown_timer():
+    """Countdown timer logic"""
+    try:
+        time.sleep(system_state.timer_duration)
+        if system_state.timer_active and not system_state.alarm_triggered:
+            trigger_alarm()
+    except Exception as e:
+        log_event('SYSTEM', f'Timer countdown error: {str(e)}', severity='ERROR')
+
+def trigger_alarm():
+    """Trigger alarm with comprehensive logging"""
+    try:
+        system_state.alarm_triggered = True
+        system_state.timer_active = False
+        system_state.stop_blink = True
+        system_state.save_state()
         
         if GPIO_AVAILABLE:
-            self.white_led.off()
-            self.red_led.off()
-            
-        self.stop_red_led_blink()
-        
-        if self.alarm_timer:
-            self.alarm_timer.cancel()
-            self.alarm_timer = None
-            
-        self.log_event('ALARM_RESET', 'Alarm was manually reset', severity='INFO')
-        self.save_state()
-        
-    def start_red_led_blink(self):
-        """Start red LED blinking"""
-        if not GPIO_AVAILABLE:
-            return
-            
-        self.stop_blink = False
-        self.red_led_blink_thread = threading.Thread(target=self._blink_red_led)
-        self.red_led_blink_thread.start()
-        
-    def stop_red_led_blink(self):
-        """Stop red LED blinking"""
-        self.stop_blink = True
-        if self.red_led_blink_thread and self.red_led_blink_thread.is_alive():
-            self.red_led_blink_thread.join(timeout=1)
-            
-        if GPIO_AVAILABLE:
-            self.red_led.off()
-            
-    def _blink_red_led(self):
-        """Blink red LED in separate thread"""
-        while not self.stop_blink:
-            if GPIO_AVAILABLE:
-                self.red_led.on()
-            time.sleep(0.5)
-            if GPIO_AVAILABLE:
-                self.red_led.off()
-            time.sleep(0.5)
-            
-    def play_alarm_sound(self):
-        """Play alarm sound if available"""
-        if AUDIO_AVAILABLE and os.path.exists(Config.AUDIO_FILE):
+            red_led.off()
+            white_led.on()
             try:
-                pygame.mixer.music.load(Config.AUDIO_FILE)
-                pygame.mixer.music.play()
-            except Exception as e:
-                print(f"Error playing alarm sound: {e}")
-        else:
-            # Fallback: system beep
-            try:
-                os.system('echo -e "\a"')
+                pygame.mixer.music.load('alarm.wav')
+                pygame.mixer.music.play(-1)
             except:
                 pass
-                
-    def log_event(self, event_type: str, description: str, user_id: Optional[int] = None, severity: str = 'INFO'):
-        """Enhanced event logging with severity levels"""
+        
+        log_event('ALARM', 'Security alarm triggered - Unauthorized access detected', 
+                 severity='CRITICAL', 
+                 additional_data=json.dumps({
+                     'door_status': 'open',
+                     'timer_duration': system_state.timer_duration,
+                     'trigger_time': datetime.now().isoformat()
+                 }))
+        
+        print("🚨 ALARM TRIGGERED! 🚨")
+    except Exception as e:
+        log_event('SYSTEM', f'Alarm trigger error: {str(e)}', severity='ERROR')
+
+def start_blink_red_led():
+    """Start blinking red LED in separate thread"""
+    if system_state.blink_thread and system_state.blink_thread.is_alive():
+        return
+        
+    system_state.stop_blink = False
+    system_state.blink_thread = threading.Thread(target=blink_red_led)
+    system_state.blink_thread.daemon = True
+    system_state.blink_thread.start()
+
+def blink_red_led():
+    """Blink red LED while timer is active"""
+    try:
+        while system_state.timer_active and not system_state.stop_blink:
+            if GPIO_AVAILABLE:
+                red_led.on()
+                time.sleep(0.5)
+                red_led.off()
+                time.sleep(0.5)
+            else:
+                time.sleep(1)
+    except Exception as e:
+        log_event('SYSTEM', f'LED blink error: {str(e)}', severity='ERROR')
+
+def reset_system():
+    """Reset system state with proper cleanup"""
+    try:
+        system_state.timer_active = False
+        system_state.alarm_triggered = False
+        system_state.stop_blink = True
+        system_state.timer_start_time = None
+        system_state.save_state()
+        
+        if GPIO_AVAILABLE:
+            red_led.off()
+            white_led.off()
+            green_led.on()
+            pygame.mixer.music.stop()
+        
+        log_event('SYSTEM', 'System manually reset', severity='INFO')
+    except Exception as e:
+        log_event('SYSTEM', f'System reset error: {str(e)}', severity='ERROR')
+
+# Door sensor monitoring
+def monitor_door():
+    """Monitor door sensor with proper state management"""
+    def door_opened():
         try:
-            conn = sqlite3.connect(Config.DATABASE)
-            cursor = conn.cursor()
-            cursor.execute('''
-                INSERT INTO events (event_type, description, user_id, severity)
-                VALUES (?, ?, ?, ?)
-            ''', (event_type, description, user_id, severity))
-            conn.commit()
-            conn.close()
-            print(f"[{severity}] {event_type}: {description}")
-        except Exception as e:
-            print(f"Error logging event: {e}")
+            system_state.door_open = True
+            system_state.save_state()
+            log_event('DOOR', 'Door opened', severity='WARNING')
             
-    def get_events(self, limit: int = 25, offset: int = 0, event_type: str = None):
-        """Get events from database"""
+            if not system_state.alarm_triggered:
+                start_timer()
+        except Exception as e:
+            log_event('SYSTEM', f'Door open handler error: {str(e)}', severity='ERROR')
+    
+    def door_closed():
         try:
-            conn = sqlite3.connect(Config.DATABASE)
-            cursor = conn.cursor()
-            
-            query = '''
-                SELECT e.*, u.username 
-                FROM events e 
-                LEFT JOIN users u ON e.user_id = u.id
-            '''
-            params = []
-            
-            if event_type:
-                query += ' WHERE e.event_type = ?'
-                params.append(event_type)
-                
-            query += ' ORDER BY e.timestamp DESC LIMIT ? OFFSET ?'
-            params.extend([limit, offset])
-            
-            cursor.execute(query, params)
-            events = cursor.fetchall()
-            conn.close()
-            return events
+            system_state.door_open = False
+            system_state.save_state()
+            log_event('DOOR', 'Door closed', severity='INFO')
         except Exception as e:
-            print(f"Error getting events: {e}")
-            return []
+            log_event('SYSTEM', f'Door close handler error: {str(e)}', severity='ERROR')
+    
+    if GPIO_AVAILABLE:
+        door_sensor.when_pressed = door_opened
+        door_sensor.when_released = door_closed
+
+# Web routes
+@app.route('/')
+@login_required
+def dashboard():
+    return render_template_string(DASHBOARD_TEMPLATE)
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        try:
+            username = request.form['username']
+            password = request.form['password']
+            password_hash = hashlib.sha256(password.encode()).hexdigest()
             
-    def get_system_status(self):
-        """Get current system status"""
-        remaining_time = None
-        if self.state.timer_active and self.state.timer_start_time:
-            elapsed = time.time() - self.state.timer_start_time
-            remaining_time = max(0, self.state.timer_duration - elapsed)
+            conn = sqlite3.connect('door_monitor.db')
+            cursor = conn.cursor()
+            cursor.execute('SELECT id, role, username FROM users WHERE username = ? AND password_hash = ?',
+                         (username, password_hash))
+            user = cursor.fetchone()
+            conn.close()
             
-        return {
-            'door_open': self.state.door_open,
-            'timer_active': self.state.timer_active,
-            'alarm_active': self.state.alarm_active,
+            if user:
+                session['user_id'] = user[0]
+                session['role'] = user[1]
+                session['username'] = user[2]
+                
+                # Update last login
+                conn = sqlite3.connect('door_monitor.db')
+                cursor = conn.cursor()
+                cursor.execute('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?', (user[0],))
+                conn.commit()
+                conn.close()
+                
+                log_event('AUTH', f'User login successful', user_id=user[0], severity='INFO')
+                return redirect(url_for('dashboard'))
+            else:
+                log_event('AUTH', f'Failed login attempt for username: {username}', severity='WARNING')
+                return render_template_string(LOGIN_TEMPLATE, error='Invalid credentials')
+        except Exception as e:
+            log_event('SYSTEM', f'Login error: {str(e)}', severity='ERROR')
+            return render_template_string(LOGIN_TEMPLATE, error='Login system error')
+    
+    return render_template_string(LOGIN_TEMPLATE)
+
+@app.route('/logout')
+def logout():
+    user_id = session.get('user_id')
+    if user_id:
+        log_event('AUTH', 'User logout', user_id=user_id, severity='INFO')
+    session.clear()
+    return redirect(url_for('login'))
+
+# API Routes with enhanced error handling
+@app.route('/api/status')
+@login_required
+def api_status():
+    """Get system status with scroll position preservation"""
+    try:
+        remaining_time = 0
+        if system_state.timer_active and system_state.timer_start_time:
+            elapsed = (datetime.now() - system_state.timer_start_time).total_seconds()
+            remaining_time = max(0, system_state.timer_duration - elapsed)
+        
+        return jsonify({
+            'success': True,
+            'door_open': system_state.door_open,
+            'timer_active': system_state.timer_active,
+            'alarm_triggered': system_state.alarm_triggered,
             'remaining_time': remaining_time,
-            'timer_duration': self.state.timer_duration,
-            'instant_alarm_mode': self.state.instant_alarm_mode,
-            'access_time': self.is_access_time(),
-            'green_led': True,  # Always on when system running
-            'red_led': self.state.timer_active,
-            'white_led': self.state.alarm_active
-        }
+            'timer_duration': system_state.timer_duration,
+            'gpio_available': GPIO_AVAILABLE,
+            'timestamp': datetime.now().isoformat()
+        })
+    except Exception as e:
+        log_event('SYSTEM', f'Status API error: {str(e)}', severity='ERROR')
+        return jsonify({'success': False, 'error': str(e)})
 
-# Initialize the monitoring system
-monitor = DoorMonitoringSystem()
+@app.route('/api/events')
+@login_required
+def api_events():
+    """Get events with pagination and filtering"""
+    try:
+        page = int(request.args.get('page', 1))
+        per_page = 25
+        offset = (page - 1) * per_page
+        
+        conn = sqlite3.connect('door_monitor.db')
+        cursor = conn.cursor()
+        
+        # Get total count
+        cursor.execute('SELECT COUNT(*) FROM events')
+        total_events = cursor.fetchone()[0]
+        
+        # Get events with user info
+        cursor.execute('''
+            SELECT e.timestamp, e.event_type, e.description, u.username, e.severity
+            FROM events e
+            LEFT JOIN users u ON e.user_id = u.id
+            ORDER BY e.timestamp DESC
+            LIMIT ? OFFSET ?
+        ''', (per_page, offset))
+        
+        events = []
+        for row in cursor.fetchall():
+            events.append({
+                'timestamp': row[0],
+                'event_type': row[1],
+                'description': row[2],
+                'username': row[3] or 'System',
+                'severity': row[4]
+            })
+        
+        conn.close()
+        
+        return jsonify({
+            'success': True,
+            'events': events,
+            'total_events': total_events,
+            'page': page,
+            'total_pages': (total_events + per_page - 1) // per_page
+        })
+    except Exception as e:
+        log_event('SYSTEM', f'Events API error: {str(e)}', severity='ERROR')
+        return jsonify({'success': False, 'error': str(e)})
 
-# Flask application
-app = Flask(__name__)
-app.secret_key = Config.SECRET_KEY
+@app.route('/api/reset', methods=['POST'])
+@login_required
+def api_reset():
+    """Reset system with proper authorization"""
+    try:
+        if session.get('role') not in ['Admin', 'Manager']:
+            return jsonify({'success': False, 'message': 'Insufficient permissions'})
+        
+        reset_system()
+        return jsonify({'success': True, 'message': 'System reset successfully'})
+    except Exception as e:
+        log_event('SYSTEM', f'Reset API error: {str(e)}', severity='ERROR')
+        return jsonify({'success': False, 'error': str(e)})
 
-# Enhanced Modern UI Template
-MAIN_TEMPLATE = '''
+@app.route('/api/update_timer', methods=['POST'])
+@login_required
+def api_update_timer():
+    """Update timer duration with validation"""
+    try:
+        if session.get('role') not in ['Admin', 'Manager']:
+            return jsonify({'success': False, 'message': 'Insufficient permissions'})
+        
+        duration = int(request.json.get('duration', 30))
+        if duration < 1 or duration > 86400:  # 1 second to 24 hours
+            return jsonify({'success': False, 'message': 'Invalid timer duration'})
+        
+        old_duration = system_state.timer_duration
+        system_state.timer_duration = duration
+        system_state.save_state()
+        
+        log_event('SETTINGS', f'Timer duration updated from {old_duration}s to {duration}s', 
+                 severity='INFO')
+        
+        return jsonify({'success': True, 'message': 'Timer updated successfully'})
+        
+    except Exception as e:
+        log_event('SYSTEM', f'Update timer API error: {str(e)}', severity='ERROR')
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/api/download_report')
+@login_required
+def download_report():
+    """Generate and download CSV report"""
+    try:
+        if session.get('role') not in ['Admin', 'Manager', 'Supervisor']:
+            return jsonify({'success': False, 'message': 'Insufficient permissions'})
+        
+        conn = sqlite3.connect('door_monitor.db')
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT e.timestamp, e.event_type, e.description, u.username, e.severity
+            FROM events e
+            LEFT JOIN users u ON e.user_id = u.id
+            ORDER BY e.timestamp DESC
+        ''')
+        
+        events = cursor.fetchall()
+        conn.close()
+        
+        # Create CSV in memory
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(['Timestamp', 'Event Type', 'Description', 'User', 'Severity'])
+        
+        for event in events:
+            writer.writerow(event)
+        
+        # Create file response
+        mem = io.BytesIO()
+        mem.write(output.getvalue().encode())
+        mem.seek(0)
+        
+        log_event('REPORT', 'Event report downloaded', severity='INFO')
+        
+        return send_file(
+            io.BytesIO(output.getvalue().encode()),
+            mimetype='text/csv',
+            as_attachment=True,
+            download_name=f'door_monitor_report_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
+        )
+        
+    except Exception as e:
+        log_event('SYSTEM', f'Report download error: {str(e)}', severity='ERROR')
+        return jsonify({'success': False, 'error': str(e)})
+
+# Enhanced HTML templates with scroll position preservation
+DASHBOARD_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Door Monitoring System - Advanced Security Dashboard</title>
+    <title>Door Monitoring System</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
         :root {
-            --primary-color: #1e293b;
-            --secondary-color: #334155;
-            --accent-color: #3b82f6;
-            --success-color: #10b981;
-            --warning-color: #f59e0b;
-            --danger-color: #ef4444;
-            --info-color: #06b6d4;
-            --light-bg: #f8fafc;
-            --card-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
-            --card-shadow-hover: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+            --primary-gradient: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            --success-gradient: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+            --warning-gradient: linear-gradient(135deg, #fa709a 0%, #fee140 100%);
+            --danger-gradient: linear-gradient(135deg, #ff6b6b 0%, #ffa500 100%);
         }
-        
-        * { font-family: 'Inter', sans-serif; }
-        
+
         body {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
             min-height: 100vh;
         }
-        
-        .main-container {
-            background: rgba(255, 255, 255, 0.95);
+
+        .navbar {
+            background: var(--primary-gradient);
+            box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+        }
+
+        .card {
+            border: none;
+            border-radius: 15px;
+            box-shadow: 0 8px 30px rgba(0,0,0,0.1);
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
             backdrop-filter: blur(10px);
-            border-radius: 20px;
-            box-shadow: var(--card-shadow-hover);
-            margin: 20px;
-            min-height: calc(100vh - 40px);
+            background: rgba(255,255,255,0.9);
         }
-        
-        .navbar-custom {
-            background: linear-gradient(90deg, var(--primary-color) 0%, var(--secondary-color) 100%);
-            border-radius: 20px 20px 0 0;
-            padding: 1rem 2rem;
+
+        .card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 15px 40px rgba(0,0,0,0.15);
         }
-        
-        .navbar-brand {
-            font-weight: 700;
-            font-size: 1.5rem;
-            color: white !important;
-        }
-        
-        .status-indicator {
-            width: 24px;
-            height: 24px;
-            border-radius: 50%;
-            display: inline-block;
-            margin-right: 12px;
-            box-shadow: 0 0 10px rgba(0,0,0,0.3);
-            border: 2px solid white;
-        }
-        
-        .status-on { 
-            background: linear-gradient(45deg, var(--success-color), #34d399);
-            animation: pulse-green 2s infinite;
-        }
-        
-        .status-off { 
-            background: linear-gradient(45deg, #6b7280, #9ca3af);
-        }
-        
-        .status-blink { 
-            background: linear-gradient(45deg, var(--danger-color), #f87171);
-            animation: blink-red 1s infinite;
-        }
-        
-        @keyframes pulse-green {
-            0%, 100% { transform: scale(1); box-shadow: 0 0 10px rgba(16, 185, 129, 0.5); }
-            50% { transform: scale(1.1); box-shadow: 0 0 20px rgba(16, 185, 129, 0.8); }
-        }
-        
-        @keyframes blink-red {
-            0%, 50% { opacity: 1; transform: scale(1); }
-            51%, 100% { opacity: 0.3; transform: scale(0.95); }
-        }
-        
-        .alarm-active {
-            background: linear-gradient(135deg, #fef3c7, #fde68a) !important;
-            border: 3px solid var(--warning-color) !important;
-            animation: alarm-pulse 1.5s infinite;
-        }
-        
-        @keyframes alarm-pulse {
-            0%, 100% { box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.7); }
-            50% { box-shadow: 0 0 0 20px rgba(245, 158, 11, 0); }
-        }
-        
-        .card-modern {
-            border: none;
-            border-radius: 16px;
-            box-shadow: var(--card-shadow);
-            transition: all 0.3s ease;
-            overflow: hidden;
-        }
-        
-        .card-modern:hover {
-            box-shadow: var(--card-shadow-hover);
-            transform: translateY(-2px);
-        }
-        
-        .card-header-modern {
-            background: linear-gradient(90deg, var(--light-bg), #ffffff);
-            border-bottom: 1px solid #e5e7eb;
-            padding: 1.5rem;
-            font-weight: 600;
-        }
-        
-        .system-status {
-            font-size: 1.2rem;
-            font-weight: 500;
-        }
-        
-        .nav-tabs-modern {
-            border: none;
-            background: var(--light-bg);
-            border-radius: 12px;
-            padding: 8px;
-            margin-bottom: 2rem;
-        }
-        
-        .nav-tabs-modern .nav-link {
-            border: none;
-            border-radius: 8px;
-            color: var(--secondary-color);
-            font-weight: 500;
-            padding: 12px 24px;
-            margin: 0 4px;
-            transition: all 0.3s ease;
-        }
-        
-        .nav-tabs-modern .nav-link.active {
-            background: white;
-            color: var(--accent-color);
-            box-shadow: var(--card-shadow);
-        }
-        
-        .nav-tabs-modern .nav-link:hover {
-            background: rgba(255, 255, 255, 0.7);
-            color: var(--accent-color);
-        }
-        
-        .btn-modern {
-            border-radius: 10px;
-            padding: 10px 20px;
-            font-weight: 500;
-            border: none;
-            transition: all 0.3s ease;
-        }
-        
-        .btn-modern:hover {
-            transform: translateY(-1px);
-            box-shadow: var(--card-shadow);
-        }
-        
-        .progress-modern {
-            height: 8px;
-            border-radius: 10px;
-            background: #e5e7eb;
-        }
-        
-        .progress-bar-modern {
-            border-radius: 10px;
-            background: linear-gradient(90deg, var(--warning-color), #fbbf24);
-        }
-        
-        .table-modern {
-            border-radius: 12px;
-            overflow: hidden;
-            box-shadow: var(--card-shadow);
-        }
-        
-        .table-modern thead {
-            background: linear-gradient(90deg, var(--primary-color), var(--secondary-color));
+
+        .status-card {
+            background: var(--success-gradient);
             color: white;
         }
-        
-        .table-modern tbody tr:hover {
-            background: var(--light-bg);
-            transform: scale(1.001);
+
+        .status-card.warning {
+            background: var(--warning-gradient);
         }
-        
-        .badge-modern {
-            padding: 6px 12px;
-            border-radius: 20px;
-            font-weight: 500;
+
+        .status-card.danger {
+            background: var(--danger-gradient);
         }
-        
-        .form-control-modern {
-            border-radius: 10px;
-            border: 2px solid #e5e7eb;
-            padding: 12px 16px;
+
+        .nav-pills .nav-link {
+            border-radius: 25px;
+            margin: 0 5px;
             transition: all 0.3s ease;
+            border: 2px solid transparent;
         }
-        
-        .form-control-modern:focus {
-            border-color: var(--accent-color);
-            box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+
+        .nav-pills .nav-link:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
         }
-        
-        .alert-modern {
+
+        .nav-pills .nav-link.active {
+            background: var(--primary-gradient);
+            border-color: rgba(255,255,255,0.3);
+        }
+
+        .btn-custom {
+            border-radius: 25px;
+            padding: 10px 25px;
+            font-weight: 600;
+            transition: all 0.3s ease;
             border: none;
-            border-radius: 12px;
-            padding: 1rem 1.5rem;
+            text-transform: uppercase;
+            letter-spacing: 1px;
         }
-        
-        .dashboard-stats {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 1rem;
-            margin-bottom: 2rem;
+
+        .btn-primary-custom {
+            background: var(--primary-gradient);
+            color: white;
         }
-        
-        .stat-card {
-            background: white;
-            border-radius: 16px;
-            padding: 1.5rem;
-            box-shadow: var(--card-shadow);
-            text-align: center;
+
+        .btn-primary-custom:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 25px rgba(102, 126, 234, 0.4);
+        }
+
+        .event-item {
+            border-left: 4px solid #007bff;
             transition: all 0.3s ease;
         }
-        
-        .stat-card:hover {
-            transform: translateY(-4px);
-            box-shadow: var(--card-shadow-hover);
+
+        .event-item:hover {
+            background-color: rgba(0,123,255,0.05);
+            transform: translateX(5px);
         }
-        
-        .stat-number {
-            font-size: 2rem;
-            font-weight: 700;
-            margin-bottom: 0.5rem;
+
+        .event-critical { border-left-color: #dc3545; }
+        .event-warning { border-left-color: #ffc107; }
+        .event-info { border-left-color: #17a2b8; }
+
+        .status-indicator {
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            display: inline-block;
+            animation: pulse 2s infinite;
+            margin-right: 10px;
         }
-        
-        .stat-label {
-            color: var(--secondary-color);
-            font-weight: 500;
+
+        .status-green { background-color: #28a745; }
+        .status-red { background-color: #dc3545; }
+        .status-white { background-color: #ffc107; }
+
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
+
+        .stats-card {
+            background: linear-gradient(135deg, rgba(255,255,255,0.1), rgba(255,255,255,0.05));
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255,255,255,0.2);
+        }
+
+        .notification-toast {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            z-index: 9999;
+            max-width: 350px;
+            border-radius: 10px;
+            box-shadow: 0 8px 30px rgba(0,0,0,0.3);
+        }
+
+        .scroll-preserve {
+            overflow-y: auto;
+            max-height: 400px;
+        }
+
+        /* Prevent layout shift during updates */
+        .status-container {
+            min-height: 200px;
+        }
+
+        .events-container {
+            min-height: 300px;
         }
     </style>
 </head>
 <body>
-    <div class="main-container">
-        <nav class="navbar navbar-custom">
-            <div class="d-flex align-items-center">
-                <i class="fas fa-shield-alt me-3" style="font-size: 1.5rem; color: var(--accent-color);"></i>
-                <span class="navbar-brand mb-0">Advanced Door Security System</span>
+    <nav class="navbar navbar-expand-lg navbar-dark">
+        <div class="container">
+            <a class="navbar-brand fw-bold">
+                <i class="fas fa-shield-alt me-2"></i>
+                Door Security Monitor
+            </a>
+            <div class="navbar-nav ms-auto">
+                <span class="navbar-text me-3">
+                    <i class="fas fa-user-circle me-1"></i>
+                    Welcome, {{ session.username }} ({{ session.role }})
+                </span>
+                <a class="btn btn-outline-light btn-sm" href="/logout">
+                    <i class="fas fa-sign-out-alt me-1"></i>Logout
+                </a>
             </div>
-            <div class="d-flex align-items-center text-white">
-                {% if session.get('user_id') %}
-                    <div class="me-4">
-                        <i class="fas fa-user-circle me-2"></i>
-                        <span class="fw-semibold">{{ session.get('username', 'User') }}</span>
-                        <span class="badge badge-modern ms-2" style="background: var(--accent-color);">{{ session.get('role', 'User') }}</span>
-                    </div>
-                    <a href="/logout" class="btn btn-outline-light btn-sm btn-modern">
-                        <i class="fas fa-sign-out-alt me-1"></i> Logout
-                    </a>
-                {% else %}
-                    <a href="/login" class="btn btn-outline-light btn-modern">
-                        <i class="fas fa-sign-in-alt me-1"></i> Login
-                    </a>
-                {% endif %}
-            </div>
-        </nav>
-
-        <div class="container-fluid p-4">
-            {% with messages = get_flashed_messages() %}
-                {% if messages %}
-                    {% for message in messages %}
-                        <div class="alert alert-info alert-modern alert-dismissible fade show" role="alert">
-                            <i class="fas fa-info-circle me-2"></i>{{ message }}
-                            <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
-                        </div>
-                    {% endfor %}
-                {% endif %}
-            {% endwith %}
-
-            {% if not session.get('user_id') %}
-                <div class="row justify-content-center">
-                    <div class="col-md-6">
-                        <div class="card card-modern">
-                            <div class="card-header-modern text-center">
-                                <h4><i class="fas fa-lock me-2"></i>Authentication Required</h4>
-                            </div>
-                            <div class="card-body text-center">
-                                <p class="mb-4">Please authenticate to access the Advanced Door Security System.</p>
-                                <a href="/login" class="btn btn-primary btn-modern">
-                                    <i class="fas fa-shield-alt me-2"></i> Secure Login
-                                </a>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            {% else %}
-                <!-- Enhanced System Status Dashboard -->
-                <div class="dashboard-stats">
-                    <div class="stat-card">
-                        <div class="stat-number" style="color: {% if status.door_open %}var(--danger-color){% else %}var(--success-color){% endif %};">
-                            <i class="fas {% if status.door_open %}fa-door-open{% else %}fa-door-closed{% endif %}"></i>
-                        </div>
-                        <div class="stat-label">
-                            Door Status: {% if status.door_open %}<strong style="color: var(--danger-color);">OPEN</strong>{% else %}<strong style="color: var(--success-color);">SECURED</strong>{% endif %}
-                        </div>
-                    </div>
-                    
-                    <div class="stat-card">
-                        <div class="stat-number" style="color: var(--success-color);">
-                            <i class="fas fa-power-off"></i>
-                        </div>
-                        <div class="stat-label">System: <strong style="color: var(--success-color);">OPERATIONAL</strong></div>
-                    </div>
-                    
-                    <div class="stat-card">
-                        <div class="stat-number" style="color: {% if status.timer_active %}var(--warning-color){% else %}var(--info-color){% endif %};">
-                            <i class="fas {% if status.timer_active %}fa-hourglass-half{% else %}fa-check-circle{% endif %}"></i>
-                        </div>
-                        <div class="stat-label">Timer: {% if status.timer_active %}<strong style="color: var(--warning-color);">ACTIVE</strong>{% else %}<strong>STANDBY</strong>{% endif %}</div>
-                    </div>
-                    
-                    <div class="stat-card">
-                        <div class="stat-number" style="color: {% if status.alarm_active %}var(--danger-color){% else %}var(--success-color){% endif %};">
-                            <i class="fas {% if status.alarm_active %}fa-exclamation-triangle{% else %}fa-shield-check{% endif %}"></i>
-                        </div>
-                        <div class="stat-label">Security: {% if status.alarm_active %}<strong style="color: var(--danger-color);">BREACH</strong>{% else %}<strong style="color: var(--success-color);">SECURE</strong>{% endif %}</div>
-                    </div>
-                </div>
-
-                <!-- Enhanced Status Card -->
-                <div class="row mb-4">
-                    <div class="col-12">
-                        <div class="card card-modern {% if status.alarm_active %}alarm-active{% endif %}">
-                            <div class="card-header-modern">
-                                <h5><i class="fas fa-tachometer-alt me-2"></i>Live System Monitor</h5>
-                            </div>
-                            <div class="card-body system-status">
-                                <div class="row">
-                                    <div class="col-md-3 mb-3">
-                                        <span class="status-indicator {% if status.door_open %}status-blink{% else %}status-off{% endif %}"></span>
-                                        <strong>Door Access Portal</strong><br>
-                                        <small class="text-muted">Physical barrier status</small>
-                                    </div>
-                                    <div class="col-md-3 mb-3">
-                                        <span class="status-indicator status-on"></span>
-                                        <strong>Core System</strong><br>
-                                        <small class="text-muted">Monitoring active</small>
-                                    </div>
-                                    <div class="col-md-3 mb-3">
-                                        <span class="status-indicator {% if status.red_led %}status-blink{% else %}status-off{% endif %}"></span>
-                                        <strong>Security Timer</strong><br>
-                                        <small class="text-muted">Countdown system</small>
-                                    </div>
-                                    <div class="col-md-3 mb-3">
-                                        <span class="status-indicator {% if status.white_led %}status-on{% else %}status-off{% endif %}"></span>
-                                        <strong>Alert System</strong><br>
-                                        <small class="text-muted">Breach notification</small>
-                                    </div>
-                                </div>
-                                
-                                {% if status.timer_active and status.remaining_time %}
-                                    <div class="mt-3">
-                                        <div class="d-flex justify-content-between mb-2">
-                                            <span><i class="fas fa-stopwatch me-1"></i>Security Timer</span>
-                                            <span class="fw-bold">{{ "%.1f"|format(status.remaining_time) }}s remaining</span>
-                                        </div>
-                                        <div class="progress progress-modern">
-                                            <div class="progress-bar progress-bar-modern progress-bar-striped progress-bar-animated" 
-                                                 style="width: {{ (status.remaining_time / status.timer_duration * 100) }}%">
-                                            </div>
-                                        </div>
-                                    </div>
-                                {% endif %}
-                                
-                                {% if status.alarm_active %}
-                                    <div class="mt-4 text-center">
-                                        <div class="alert alert-danger alert-modern mb-3">
-                                            <i class="fas fa-exclamation-triangle fa-2x mb-2"></i><br>
-                                            <strong>SECURITY BREACH DETECTED</strong><br>
-                                            Immediate attention required
-                                        </div>
-                                        <button class="btn btn-danger btn-modern btn-lg" onclick="resetAlarm()">
-                                            <i class="fas fa-shield-alt me-2"></i> Reset Security System
-                                        </button>
-                                    </div>
-                                {% endif %}
-                            </div>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Enhanced Navigation Tabs -->
-                <ul class="nav nav-tabs nav-tabs-modern" id="systemTabs" role="tablist">
-                    <li class="nav-item" role="presentation">
-                        <button class="nav-link active" id="events-tab" data-bs-toggle="tab" data-bs-target="#events" type="button">
-                            <i class="fas fa-list-alt me-2"></i> Security Events
-                        </button>
-                    </li>
-                    <li class="nav-item" role="presentation">
-                        <button class="nav-link" id="settings-tab" data-bs-toggle="tab" data-bs-target="#settings" type="button">
-                            <i class="fas fa-cogs me-2"></i> System Configuration
-                        </button>
-                    </li>
-                    <li class="nav-item" role="presentation">
-                        <button class="nav-link" id="schedules-tab" data-bs-toggle="tab" data-bs-target="#schedules" type="button">
-                            <i class="fas fa-calendar-alt me-2"></i> Access Schedules
-                        </button>
-                    </li>
-                    {% if session.get('role') == 'Admin' %}
-                    <li class="nav-item" role="presentation">
-                        <button class="nav-link" id="users-tab" data-bs-toggle="tab" data-bs-target="#users" type="button">
-                            <i class="fas fa-users-cog me-2"></i> User Management
-                        </button>
-                    </li>
-                    {% endif %}
-                    <li class="nav-item" role="presentation">
-                        <button class="nav-link" id="reports-tab" data-bs-toggle="tab" data-bs-target="#reports" type="button">
-                            <i class="fas fa-chart-bar me-2"></i> Analytics & Reports
-                        </button>
-                    </li>
-                </ul>
-
-                <!-- Enhanced Tab Content -->
-                <div class="tab-content" id="systemTabsContent">
-                    <!-- Events Tab -->
-                    <div class="tab-pane fade show active" id="events" role="tabpanel">
-                        <div class="card card-modern">
-                            <div class="card-header-modern d-flex justify-content-between align-items-center">
-                                <h5><i class="fas fa-shield-alt me-2"></i>Security Event Log</h5>
-                                <button class="btn btn-outline-primary btn-modern btn-sm" onclick="refreshEvents()">
-                                    <i class="fas fa-sync-alt me-1"></i> Refresh
-                                </button>
-                            </div>
-                            <div class="card-body">
-                                <div class="table-responsive">
-                                    <table class="table table-modern" id="eventsTable">
-                                        <thead>
-                                            <tr>
-                                                <th><i class="fas fa-clock me-1"></i>Timestamp</th>
-                                                <th><i class="fas fa-tag me-1"></i>Event Type</th>
-                                                <th><i class="fas fa-info-circle me-1"></i>Description</th>
-                                                <th><i class="fas fa-user me-1"></i>User</th>
-                                                <th><i class="fas fa-exclamation-circle me-1"></i>Severity</th>
-                                            </tr>
-                                        </thead>
-                                        <tbody>
-                                            {% for event in events %}
-                                            <tr>
-                                                <td class="fw-semibold">{{ event[1] }}</td>
-                                                <td>
-                                                    {% if event[2] == 'DOOR_OPEN' %}
-                                                        <span class="badge badge-modern" style="background: var(--warning-color);"><i class="fas fa-door-open me-1"></i>{{ event[2] }}</span>
-                                                    {% elif event[2] == 'DOOR_CLOSE' %}
-                                                        <span class="badge badge-modern" style="background: var(--success-color);"><i class="fas fa-door-closed me-1"></i>{{ event[2] }}</span>
-                                                    {% elif event[2] == 'ALARM_TRIGGER' %}
-                                                        <span class="badge badge-modern" style="background: var(--danger-color);"><i class="fas fa-exclamation-triangle me-1"></i>{{ event[2] }}</span>
-                                                    {% elif event[2] == 'LOGIN' %}
-                                                        <span class="badge badge-modern" style="background: var(--info-color);"><i class="fas fa-sign-in-alt me-1"></i>{{ event[2] }}</span>
-                                                    {% else %}
-                                                        <span class="badge badge-modern" style="background: var(--secondary-color);"><i class="fas fa-cog me-1"></i>{{ event[2] }}</span>
-                                                    {% endif %}
-                                                </td>
-                                                <td>{{ event[3] }}</td>
-                                                <td>
-                                                    {% if event[7] %}
-                                                        <i class="fas fa-user me-1"></i>{{ event[7] }}
-                                                    {% else %}
-                                                        <i class="fas fa-microchip me-1"></i><em>System</em>
-                                                    {% endif %}
-                                                </td>
-                                                <td>
-                                                    {% set severity = event[6] or 'INFO' %}
-                                                    {% if severity == 'CRITICAL' %}
-                                                        <span class="badge badge-modern" style="background: var(--danger-color);"><i class="fas fa-exclamation-triangle me-1"></i>{{ severity }}</span>
-                                                    {% elif severity == 'WARNING' %}
-                                                        <span class="badge badge-modern" style="background: var(--warning-color);"><i class="fas fa-exclamation me-1"></i>{{ severity }}</span>
-                                                    {% else %}
-                                                        <span class="badge badge-modern" style="background: var(--info-color);"><i class="fas fa-info me-1"></i>{{ severity }}</span>
-                                                    {% endif %}
-                                                </td>
-                                            </tr>
-                                            {% endfor %}
-                                        </tbody>
-                                    </table>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-
-                    <!-- Settings Tab -->
-                    <div class="tab-pane fade" id="settings" role="tabpanel">
-                        <div class="row">
-                            <div class="col-md-6">
-                                <div class="card card-modern">
-                                    <div class="card-header-modern">
-                                        <h5><i class="fas fa-stopwatch me-2"></i>Security Timer Configuration</h5>
-                                    </div>
-                                    <div class="card-body">
-                                        <form onsubmit="updateSettings(event)">
-                                            <div class="mb-4">
-                                                <label for="timerDuration" class="form-label fw-semibold">
-                                                    <i class="fas fa-clock me-1"></i>Timer Duration (seconds)
-                                                </label>
-                                                <input type="number" class="form-control form-control-modern" id="timerDuration" 
-                                                       value="{{ status.timer_duration }}" min="1" max="86400">
-                                                <div class="form-text">Set countdown time before alarm triggers</div>
-                                            </div>
-                                            <div class="mb-4">
-                                                <div class="form-check">
-                                                    <input class="form-check-input" type="checkbox" id="instantAlarm" 
-                                                           {% if status.instant_alarm_mode %}checked{% endif %}>
-                                                    <label class="form-check-label fw-semibold" for="instantAlarm">
-                                                        <i class="fas fa-bolt me-1"></i>Instant Alarm Mode
-                                                    </label>
-                                                    <div class="form-text">Trigger alarm immediately outside scheduled hours</div>
-                                                </div>
-                                            </div>
-                                            <button type="submit" class="btn btn-primary btn-modern">
-                                                <i class="fas fa-save me-2"></i> Save Configuration
-                                            </button>
-                                        </form>
-                                    </div>
-                                </div>
-                            </div>
-                            <div class="col-md-6">
-                                <div class="card card-modern">
-                                    <div class="card-header-modern">
-                                        <h5><i class="fas fa-tools me-2"></i>System Diagnostics</h5>
-                                    </div>
-                                    <div class="card-body">
-                                        <div class="d-grid gap-3">
-                                            <button class="btn btn-warning btn-modern" onclick="testAlarm()">
-                                                <i class="fas fa-volume-up me-2"></i> Test Audio Alert
-                                            </button>
-                                            <button class="btn btn-info btn-modern" onclick="testLEDs()">
-                                                <i class="fas fa-lightbulb me-2"></i> Test LED Indicators
-                                            </button>
-                                            {% if status.alarm_active %}
-                                            <button class="btn btn-danger btn-modern" onclick="resetAlarm()">
-                                                <i class="fas fa-shield-alt me-2"></i> Emergency Reset
-                                            </button>
-                                            {% endif %}
-                                        </div>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-
-                    <!-- Schedules Tab -->
-                    <div class="tab-pane fade" id="schedules" role="tabpanel">
-                        <div class="card card-modern">
-                            <div class="card-header-modern">
-                                <h5><i class="fas fa-calendar-check me-2"></i>Access Time Management</h5>
-                            </div>
-                            <div class="card-body">
-                                <div class="row">
-                                    <div class="col-md-6">
-                                        <h6 class="fw-bold mb-3"><i class="fas fa-briefcase me-2"></i>Weekday Schedule</h6>
-                                        <div class="mb-4">
-                                            <label class="form-label fw-semibold">Morning Access</label>
-                                            <div class="row">
-                                                <div class="col">
-                                                    <input type="time" class="form-control form-control-modern" id="weekday_morning_start" 
-                                                           value="{{ schedules.weekday.morning.start }}">
-                                                </div>
-                                                <div class="col">
-                                                    <input type="time" class="form-control form-control-modern" id="weekday_morning_end" 
-                                                           value="{{ schedules.weekday.morning.end }}">
-                                                </div>
-                                            </div>
-                                        </div>
-                                        <div class="mb-4">
-                                            <label class="form-label fw-semibold">Afternoon Access</label>
-                                            <div class="row">
-                                                <div class="col">
-                                                    <input type="time" class="form-control form-control-modern" id="weekday_afternoon_start" 
-                                                           value="{{ schedules.weekday.afternoon.start }}">
-                                                </div>
-                                                <div class="col">
-                                                    <input type="time" class="form-control form-control-modern" id="weekday_afternoon_end" 
-                                                           value="{{ schedules.weekday.afternoon.end }}">
-                                                </div>
-                                            </div>
-                                        </div>
-                                        <div class="mb-4">
-                                            <label class="form-label fw-semibold">Evening Access</label>
-                                            <div class="row">
-                                                <div class="col">
-                                                    <input type="time" class="form-control form-control-modern" id="weekday_evening_start" 
-                                                           value="{{ schedules.weekday.evening.start }}">
-                                                </div>
-                                                <div class="col">
-                                                    <input type="time" class="form-control form-control-modern" id="weekday_evening_end" 
-                                                           value="{{ schedules.weekday.evening.end }}">
-                                                </div>
-                                            </div>
-                                        </div>
-                                    </div>
-                                    <div class="col-md-6">
-                                        <h6 class="fw-bold mb-3"><i class="fas fa-home me-2"></i>Weekend Schedule</h6>
-                                        <div class="mb-4">
-                                            <label class="form-label fw-semibold">Morning Access</label>
-                                            <div class="row">
-                                                <div class="col">
-                                                    <input type="time" class="form-control form-control-modern" id="weekend_morning_start" 
-                                                           value="{{ schedules.weekend.morning.start }}">
-                                                </div>
-                                                <div class="col">
-                                                    <input type="time" class="form-control form-control-modern" id="weekend_morning_end" 
-                                                           value="{{ schedules.weekend.morning.end }}">
-                                                </div>
-                                            </div>
-                                        </div>
-                                        <div class="mb-4">
-                                            <label class="form-label fw-semibold">Afternoon Access</label>
-                                            <div class="row">
-                                                <div class="col">
-                                                    <input type="time" class="form-control form-control-modern" id="weekend_afternoon_start" 
-                                                           value="{{ schedules.weekend.afternoon.start }}">
-                                                </div>
-                                                <div class="col">
-                                                    <input type="time" class="form-control form-control-modern" id="weekend_afternoon_end" 
-                                                           value="{{ schedules.weekend.afternoon.end }}">
-                                                </div>
-                                            </div>
-                                        </div>
-                                        <div class="mb-4">
-                                            <label class="form-label fw-semibold">Evening Access</label>
-                                            <div class="row">
-                                                <div class="col">
-                                                    <input type="time" class="form-control form-control-modern" id="weekend_evening_start" 
-                                                           value="{{ schedules.weekend.evening.start }}">
-                                                </div>
-                                                <div class="col">
-                                                    <input type="time" class="form-control form-control-modern" id="weekend_evening_end" 
-                                                           value="{{ schedules.weekend.evening.end }}">
-                                                </div>
-                                            </div>
-                                        </div>
-                                    </div>
-                                </div>
-                                <div class="text-center">
-                                    <button class="btn btn-primary btn-modern btn-lg" onclick="saveSchedules()">
-                                        <i class="fas fa-calendar-check me-2"></i> Update Access Schedule
-                                    </button>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-
-                    <!-- Users Tab (Admin only) -->
-                    {% if session.get('role') == 'Admin' %}
-                    <div class="tab-pane fade" id="users" role="tabpanel">
-                        <div class="card card-modern">
-                            <div class="card-header-modern d-flex justify-content-between align-items-center">
-                                <h5><i class="fas fa-users-cog me-2"></i>User Administration</h5>
-                                <button class="btn btn-primary btn-modern" data-bs-toggle="modal" data-bs-target="#addUserModal">
-                                    <i class="fas fa-user-plus me-2"></i> Add New User
-                                </button>
-                            </div>
-                            <div class="card-body">
-                                <div class="table-responsive">
-                                    <table class="table table-modern">
-                                        <thead>
-                                            <tr>
-                                                <th><i class="fas fa-user me-1"></i>Username</th>
-                                                <th><i class="fas fa-envelope me-1"></i>Email</th>
-                                                <th><i class="fas fa-building me-1"></i>Department</th>
-                                                <th><i class="fas fa-shield-alt me-1"></i>Role</th>
-                                                <th><i class="fas fa-cogs me-1"></i>Actions</th>
-                                            </tr>
-                                        </thead>
-                                        <tbody id="usersTableBody">
-                                            {% for user in users %}
-                                            <tr>
-                                                <td class="fw-semibold">
-                                                    <i class="fas fa-user-circle me-2"></i>{{ user[1] }}
-                                                </td>
-                                                <td>{{ user[3] or '-' }}</td>
-                                                <td>{{ user[4] or '-' }}</td>
-                                                <td>
-                                                    {% if user[7] == 'Admin' %}
-                                                        <span class="badge badge-modern" style="background: var(--danger-color);"><i class="fas fa-crown me-1"></i>{{ user[7] }}</span>
-                                                    {% elif user[7] == 'Manager' %}
-                                                        <span class="badge badge-modern" style="background: var(--warning-color);"><i class="fas fa-star me-1"></i>{{ user[7] }}</span>
-                                                    {% else %}
-                                                        <span class="badge badge-modern" style="background: var(--info-color);"><i class="fas fa-user me-1"></i>{{ user[7] }}</span>
-                                                    {% endif %}
-                                                </td>
-                                                <td>
-                                                    {% if user[1] != 'admin' %}
-                                                    <button class="btn btn-outline-danger btn-sm btn-modern" onclick="deleteUser({{ user[0] }})">
-                                                        <i class="fas fa-trash-alt"></i>
-                                                    </button>
-                                                    {% endif %}
-                                                </td>
-                                            </tr>
-                                            {% endfor %}
-                                        </tbody>
-                                    </table>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                    {% endif %}
-
-                    <!-- Reports Tab -->
-                    <div class="tab-pane fade" id="reports" role="tabpanel">
-                        <div class="card card-modern">
-                            <div class="card-header-modern">
-                                <h5><i class="fas fa-chart-line me-2"></i>Advanced Analytics & Export</h5>
-                            </div>
-                            <div class="card-body">
-                                <div class="row">
-                                    <div class="col-md-6">
-                                        <h6 class="fw-bold mb-3"><i class="fas fa-download me-2"></i>Export Security Events</h6>
-                                        <form onsubmit="exportData(event)">
-                                            <div class="mb-3">
-                                                <label for="exportFormat" class="form-label fw-semibold">Export Format</label>
-                                                <select class="form-select form-control-modern" id="exportFormat">
-                                                    <option value="csv"><i class="fas fa-file-csv"></i> CSV Spreadsheet</option>
-                                                    <option value="pdf"><i class="fas fa-file-pdf"></i> PDF Report</option>
-                                                </select>
-                                            </div>
-                                            <div class="mb-3">
-                                                <label for="dateFrom" class="form-label fw-semibold">From Date</label>
-                                                <input type="date" class="form-control form-control-modern" id="dateFrom">
-                                            </div>
-                                            <div class="mb-3">
-                                                <label for="dateTo" class="form-label fw-semibold">To Date</label>
-                                                <input type="date" class="form-control form-control-modern" id="dateTo">
-                                            </div>
-                                            <button type="submit" class="btn btn-success btn-modern">
-                                                <i class="fas fa-download me-2"></i> Generate Report
-                                            </button>
-                                        </form>
-                                    </div>
-                                    <div class="col-md-6">
-                                        <h6 class="fw-bold mb-3"><i class="fas fa-database me-2"></i>System Backup</h6>
-                                        <div class="alert alert-info alert-modern">
-                                            <i class="fas fa-info-circle me-2"></i>
-                                            Create comprehensive backup including all security data, user accounts, and system logs.
-                                        </div>
-                                        <button class="btn btn-warning btn-modern btn-lg" onclick="createBackup()">
-                                            <i class="fas fa-shield-alt me-2"></i> Create Secure Backup
-                                        </button>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            {% endif %}
         </div>
-    </div>
+    </nav>
 
-    <!-- Enhanced Add User Modal -->
-    <div class="modal fade" id="addUserModal" tabindex="-1">
-        <div class="modal-dialog modal-lg">
-            <div class="modal-content" style="border-radius: 16px; border: none;">
-                <div class="modal-header" style="background: linear-gradient(90deg, var(--primary-color), var(--secondary-color)); color: white; border-radius: 16px 16px 0 0;">
-                    <h5 class="modal-title"><i class="fas fa-user-plus me-2"></i>Add New User Account</h5>
-                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+    <div class="container mt-4">
+        <!-- Status Dashboard -->
+        <div class="row mb-4">
+            <div class="col-12">
+                <div class="card">
+                    <div class="card-body">
+                        <h5 class="card-title mb-4">
+                            <i class="fas fa-tachometer-alt me-2"></i>System Status
+                        </h5>
+                        <div class="row status-container" id="statusContainer">
+                            <div class="col-md-3 mb-3">
+                                <div class="card status-card" id="doorStatusCard">
+                                    <div class="card-body text-center">
+                                        <i class="fas fa-door-open fa-2x mb-2"></i>
+                                        <h6>Door Status</h6>
+                                        <span id="doorStatus">Loading...</span>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-3 mb-3">
+                                <div class="card status-card" id="timerStatusCard">
+                                    <div class="card-body text-center">
+                                        <i class="fas fa-clock fa-2x mb-2"></i>
+                                        <h6>Timer Status</h6>
+                                        <span id="timerStatus">Loading...</span>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-3 mb-3">
+                                <div class="card status-card" id="alarmStatusCard">
+                                    <div class="card-body text-center">
+                                        <i class="fas fa-bell fa-2x mb-2"></i>
+                                        <h6>Alarm Status</h6>
+                                        <span id="alarmStatus">Loading...</span>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-3 mb-3">
+                                <div class="card status-card">
+                                    <div class="card-body text-center">
+                                        <i class="fas fa-microchip fa-2x mb-2"></i>
+                                        <h6>GPIO Status</h6>
+                                        <span id="gpioStatus">Loading...</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="text-center mt-3">
+                            <button class="btn btn-danger btn-custom" onclick="resetSystem()">
+                                <i class="fas fa-power-off me-2"></i>Reset System
+                            </button>
+                        </div>
+                    </div>
                 </div>
-                <form onsubmit="addUser(event)">
-                    <div class="modal-body p-4">
+            </div>
+        </div>
+
+        <!-- Navigation Tabs -->
+        <ul class="nav nav-pills mb-4 justify-content-center" id="mainTabs">
+            <li class="nav-item">
+                <a class="nav-link active" data-bs-toggle="pill" href="#events-tab">
+                    <i class="fas fa-list me-2"></i>Events
+                </a>
+            </li>
+            <li class="nav-item">
+                <a class="nav-link" data-bs-toggle="pill" href="#settings-tab">
+                    <i class="fas fa-cog me-2"></i>Settings
+                </a>
+            </li>
+            <li class="nav-item">
+                <a class="nav-link" data-bs-toggle="pill" href="#users-tab">
+                    <i class="fas fa-users me-2"></i>Users
+                </a>
+            </li>
+            <li class="nav-item">
+                <a class="nav-link" data-bs-toggle="pill" href="#reports-tab">
+                    <i class="fas fa-chart-bar me-2"></i>Reports
+                </a>
+            </li>
+            <li class="nav-item">
+                <a class="nav-link" data-bs-toggle="pill" href="#schedules-tab">
+                    <i class="fas fa-calendar me-2"></i>Schedules
+                </a>
+            </li>
+        </ul>
+
+        <!-- Tab Content -->
+        <div class="tab-content">
+            <!-- Events Tab -->
+            <div class="tab-pane fade show active" id="events-tab">
+                <div class="card">
+                    <div class="card-header">
+                        <h5 class="mb-0">
+                            <i class="fas fa-history me-2"></i>Recent Events
+                        </h5>
+                    </div>
+                    <div class="card-body">
+                        <div class="events-container scroll-preserve" id="eventsContainer">
+                            <div class="text-center">
+                                <div class="spinner-border text-primary" role="status">
+                                    <span class="visually-hidden">Loading events...</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Settings Tab -->
+            <div class="tab-pane fade" id="settings-tab">
+                <div class="card">
+                    <div class="card-header">
+                        <h5 class="mb-0">
+                            <i class="fas fa-sliders-h me-2"></i>System Settings
+                        </h5>
+                    </div>
+                    <div class="card-body">
                         <div class="row">
                             <div class="col-md-6">
                                 <div class="mb-3">
-                                    <label for="newUsername" class="form-label fw-semibold">
-                                        <i class="fas fa-user me-1"></i>Username
-                                    </label>
-                                    <input type="text" class="form-control form-control-modern" id="newUsername" required>
+                                    <label for="timerDuration" class="form-label">Timer Duration (seconds)</label>
+                                    <input type="number" class="form-control" id="timerDuration" min="1" max="86400" value="30">
                                 </div>
-                                <div class="mb-3">
-                                    <label for="newPassword" class="form-label fw-semibold">
-                                        <i class="fas fa-lock me-1"></i>Password
-                                    </label>
-                                    <input type="password" class="form-control form-control-modern" id="newPassword" required>
-                                </div>
-                                <div class="mb-3">
-                                    <label for="newEmail" class="form-label fw-semibold">
-                                        <i class="fas fa-envelope me-1"></i>Email Address
-                                    </label>
-                                    <input type="email" class="form-control form-control-modern" id="newEmail">
-                                </div>
+                                <button class="btn btn-primary btn-custom" onclick="updateTimer()">
+                                    <i class="fas fa-save me-2"></i>Update Timer
+                                </button>
                             </div>
                             <div class="col-md-6">
-                                <div class="mb-3">
-                                    <label for="newDepartment" class="form-label fw-semibold">
-                                        <i class="fas fa-building me-1"></i>Department
-                                    </label>
-                                    <input type="text" class="form-control form-control-modern" id="newDepartment">
-                                </div>
-                                <div class="mb-3">
-                                    <label for="newRole" class="form-label fw-semibold">
-                                        <i class="fas fa-shield-alt me-1"></i>Security Role
-                                    </label>
-                                    <select class="form-select form-control-modern" id="newRole">
-                                        <option value="User">Standard User</option>
-                                        <option value="Supervisor">Supervisor</option>
-                                        <option value="Manager">Manager</option>
-                                        <option value="Admin">Administrator</option>
-                                    </select>
+                                <div class="alert alert-info">
+                                    <h6><i class="fas fa-info-circle me-2"></i>Current Settings</h6>
+                                    <p class="mb-1">Timer Duration: <span id="currentTimer">30</span> seconds</p>
+                                    <p class="mb-0">Last Updated: <span id="lastUpdated">Never</span></p>
                                 </div>
                             </div>
                         </div>
                     </div>
-                    <div class="modal-footer p-4">
-                        <button type="button" class="btn btn-secondary btn-modern" data-bs-dismiss="modal">
-                            <i class="fas fa-times me-1"></i> Cancel
-                        </button>
-                        <button type="submit" class="btn btn-primary btn-modern">
-                            <i class="fas fa-user-plus me-1"></i> Create User Account
-                        </button>
+                </div>
+            </div>
+
+            <!-- Users Tab -->
+            <div class="tab-pane fade" id="users-tab">
+                <div class="card">
+                    <div class="card-header">
+                        <h5 class="mb-0">
+                            <i class="fas fa-user-cog me-2"></i>User Management
+                        </h5>
                     </div>
-                </form>
+                    <div class="card-body">
+                        <div class="alert alert-warning">
+                            <i class="fas fa-construction me-2"></i>
+                            User management interface coming soon. Contact administrator for user account changes.
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Reports Tab -->
+            <div class="tab-pane fade" id="reports-tab">
+                <div class="card">
+                    <div class="card-header">
+                        <h5 class="mb-0">
+                            <i class="fas fa-download me-2"></i>Generate Reports
+                        </h5>
+                    </div>
+                    <div class="card-body">
+                        <div class="row">
+                            <div class="col-md-6">
+                                <h6>Export Options</h6>
+                                <button class="btn btn-success btn-custom me-2" onclick="downloadReport()">
+                                    <i class="fas fa-file-csv me-2"></i>Download CSV Report
+                                </button>
+                            </div>
+                            <div class="col-md-6">
+                                <div class="alert alert-info">
+                                    <h6><i class="fas fa-info-circle me-2"></i>Report Contents</h6>
+                                    <ul class="mb-0">
+                                        <li>All system events</li>
+                                        <li>User activities</li>
+                                        <li>Door status changes</li>
+                                        <li>Alarm triggers</li>
+                                    </ul>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Schedules Tab -->
+            <div class="tab-pane fade" id="schedules-tab">
+                <div class="card">
+                    <div class="card-header">
+                        <h5 class="mb-0">
+                            <i class="fas fa-clock me-2"></i>Access Schedules
+                        </h5>
+                    </div>
+                    <div class="card-body">
+                        <div class="alert alert-info">
+                            <i class="fas fa-calendar-check me-2"></i>
+                            Schedule management interface coming soon. Contact administrator for schedule changes.
+                        </div>
+                    </div>
+                </div>
             </div>
         </div>
     </div>
+
+    <!-- Notification Toast Container -->
+    <div id="toastContainer" class="position-fixed top-0 end-0 p-3" style="z-index: 9999;"></div>
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     <script>
-        // Fixed: Auto-refresh with proper tab state management
-        let currentTab = 'events';
+        let lastScrollPosition = 0;
+        let updateInProgress = false;
         
-        // Track active tab
-        document.querySelectorAll('[data-bs-toggle="tab"]').forEach(tab => {
-            tab.addEventListener('shown.bs.tab', function (e) {
-                currentTab = e.target.getAttribute('data-bs-target').replace('#', '');
-                console.log('Tab switched to:', currentTab);
-            });
-        });
-        
-        // Auto-refresh with tab preservation
-        setInterval(function() {
-            if (document.visibilityState === 'visible') {
-                const urlParams = new URLSearchParams(window.location.search);
-                urlParams.set('tab', currentTab);
-                const newUrl = window.location.pathname + '?' + urlParams.toString();
-                window.location.href = newUrl;
-            }
-        }, 3000);
-        
-        // Restore tab on page load
-        window.addEventListener('load', function() {
-            const urlParams = new URLSearchParams(window.location.search);
-            const activeTab = urlParams.get('tab') || 'events';
+        // Preserve scroll position during updates
+        function preserveScroll(callback) {
+            if (updateInProgress) return;
+            updateInProgress = true;
             
-            // Hide all tab content
-            document.querySelectorAll('.tab-pane').forEach(pane => {
-                pane.classList.remove('show', 'active');
+            const scrollableElements = document.querySelectorAll('.scroll-preserve');
+            const scrollPositions = {};
+            
+            scrollableElements.forEach((element, index) => {
+                scrollPositions[index] = element.scrollTop;
             });
             
-            // Remove active from all tab buttons
-            document.querySelectorAll('.nav-link').forEach(link => {
-                link.classList.remove('active');
+            callback();
+            
+            setTimeout(() => {
+                scrollableElements.forEach((element, index) => {
+                    if (scrollPositions[index] !== undefined) {
+                        element.scrollTop = scrollPositions[index];
+                    }
+                });
+                updateInProgress = false;
+            }, 100);
+        }
+        
+        // Show notification toast
+        function showNotification(message, type = 'info') {
+            const toastContainer = document.getElementById('toastContainer');
+            const toastId = 'toast-' + Date.now();
+            
+            const toastHtml = `
+                <div id="${toastId}" class="toast notification-toast" role="alert">
+                    <div class="toast-header bg-${type} text-white">
+                        <i class="fas fa-${type === 'success' ? 'check-circle' : type === 'danger' ? 'exclamation-triangle' : 'info-circle'} me-2"></i>
+                        <strong class="me-auto">System Alert</strong>
+                        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="toast"></button>
+                    </div>
+                    <div class="toast-body">${message}</div>
+                </div>
+            `;
+            
+            toastContainer.insertAdjacentHTML('beforeend', toastHtml);
+            
+            const toast = new bootstrap.Toast(document.getElementById(toastId));
+            toast.show();
+            
+            // Auto remove after toast hides
+            document.getElementById(toastId).addEventListener('hidden.bs.toast', function() {
+                this.remove();
             });
-            
-            // Show selected tab
-            const targetPane = document.getElementById(activeTab);
-            const targetButton = document.getElementById(activeTab + '-tab');
-            
-            if (targetPane && targetButton) {
-                targetPane.classList.add('show', 'active');
-                targetButton.classList.add('active');
-                currentTab = activeTab;
-            }
-        });
-
-        function resetAlarm() {
-            fetch('/api/reset_alarm', { method: 'POST' })
+        }
+        
+        // Update system status with scroll preservation
+        function updateStatus() {
+            preserveScroll(() => {
+                fetch('/api/status')
+                    .then(response => response.json())
+                    .then(data => {
+                        if (data.success) {
+                            // Update door status
+                            const doorCard = document.getElementById('doorStatusCard');
+                            const doorStatus = document.getElementById('doorStatus');
+                            if (data.door_open) {
+                                doorCard.className = 'card status-card danger';
+                                doorStatus.innerHTML = '<i class="fas fa-door-open me-1"></i>Open';
+                            } else {
+                                doorCard.className = 'card status-card';
+                                doorStatus.innerHTML = '<i class="fas fa-door-closed me-1"></i>Closed';
+                            }
+                            
+                            // Update timer status
+                            const timerCard = document.getElementById('timerStatusCard');
+                            const timerStatus = document.getElementById('timerStatus');
+                            if (data.timer_active) {
+                                timerCard.className = 'card status-card warning';
+                                timerStatus.innerHTML = `<i class="fas fa-hourglass-half me-1"></i>${Math.ceil(data.remaining_time)}s`;
+                            } else {
+                                timerCard.className = 'card status-card';
+                                timerStatus.innerHTML = '<i class="fas fa-pause me-1"></i>Inactive';
+                            }
+                            
+                            // Update alarm status
+                            const alarmCard = document.getElementById('alarmStatusCard');
+                            const alarmStatus = document.getElementById('alarmStatus');
+                            if (data.alarm_triggered) {
+                                alarmCard.className = 'card status-card danger';
+                                alarmStatus.innerHTML = '<i class="fas fa-exclamation-triangle me-1"></i>TRIGGERED';
+                            } else {
+                                alarmCard.className = 'card status-card';
+                                alarmStatus.innerHTML = '<i class="fas fa-check me-1"></i>Normal';
+                            }
+                            
+                            // Update GPIO status
+                            document.getElementById('gpioStatus').innerHTML = data.gpio_available ? 
+                                '<i class="fas fa-check me-1"></i>Active' : 
+                                '<i class="fas fa-times me-1"></i>Simulation';
+                            
+                            // Update current timer display
+                            document.getElementById('currentTimer').textContent = data.timer_duration;
+                            document.getElementById('timerDuration').value = data.timer_duration;
+                        }
+                    })
+                    .catch(error => {
+                        console.error('Status update error:', error);
+                        if (!updateInProgress) {
+                            showNotification('Connection error - retrying...', 'danger');
+                        }
+                    });
+            });
+        }
+        
+        // Load events with scroll preservation
+        function loadEvents() {
+            preserveScroll(() => {
+                fetch('/api/events')
+                    .then(response => response.json())
+                    .then(data => {
+                        if (data.success) {
+                            const eventsContainer = document.getElementById('eventsContainer');
+                            if (data.events.length === 0) {
+                                eventsContainer.innerHTML = '<div class="text-center text-muted">No events recorded yet.</div>';
+                                return;
+                            }
+                            
+                            let eventsHtml = '';
+                            data.events.forEach(event => {
+                                const severityClass = event.severity.toLowerCase();
+                                const iconClass = {
+                                    'critical': 'fas fa-exclamation-triangle text-danger',
+                                    'warning': 'fas fa-exclamation-circle text-warning',
+                                    'info': 'fas fa-info-circle text-info',
+                                    'error': 'fas fa-times-circle text-danger'
+                                }[severityClass] || 'fas fa-circle text-secondary';
+                                
+                                eventsHtml += `
+                                    <div class="event-item event-${severityClass} p-3 mb-2 bg-light rounded">
+                                        <div class="d-flex justify-content-between align-items-start">
+                                            <div class="flex-grow-1">
+                                                <div class="d-flex align-items-center mb-1">
+                                                    <i class="${iconClass} me-2"></i>
+                                                    <strong>${event.event_type}</strong>
+                                                    <span class="badge bg-${severityClass === 'critical' ? 'danger' : severityClass} ms-2">${event.severity}</span>
+                                                </div>
+                                                <p class="mb-1">${event.description}</p>
+                                                <small class="text-muted">
+                                                    <i class="fas fa-user me-1"></i>${event.username} • 
+                                                    <i class="fas fa-clock me-1"></i>${new Date(event.timestamp).toLocaleString()}
+                                                </small>
+                                            </div>
+                                        </div>
+                                    </div>
+                                `;
+                            });
+                            
+                            eventsContainer.innerHTML = eventsHtml;
+                        }
+                    })
+                    .catch(error => {
+                        console.error('Events loading error:', error);
+                        document.getElementById('eventsContainer').innerHTML = 
+                            '<div class="alert alert-danger">Error loading events. Please refresh the page.</div>';
+                    });
+            });
+        }
+        
+        // Reset system
+        function resetSystem() {
+            if (confirm('Are you sure you want to reset the system? This will clear all active alarms and timers.')) {
+                fetch('/api/reset', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                })
                 .then(response => response.json())
                 .then(data => {
                     if (data.success) {
-                        showNotification('Security system reset successfully', 'success');
-                        setTimeout(() => location.reload(), 1000);
+                        showNotification('System reset successfully', 'success');
+                        updateStatus();
+                        loadEvents();
+                    } else {
+                        showNotification(data.message || 'Reset failed', 'danger');
                     }
+                })
+                .catch(error => {
+                    console.error('Reset error:', error);
+                    showNotification('Reset failed - connection error', 'danger');
                 });
-        }
-
-        function testAlarm() {
-            fetch('/api/test_alarm', { method: 'POST' })
-                .then(response => response.json())
-                .then(data => {
-                    showNotification(data.message, 'info');
-                });
-        }
-
-        function testLEDs() {
-            fetch('/api/test_leds', { method: 'POST' })
-                .then(response => response.json())
-                .then(data => {
-                    showNotification(data.message, 'info');
-                });
-        }
-
-        function updateSettings(event) {
-            event.preventDefault();
-            const data = {
-                timer_duration: document.getElementById('timerDuration').value,
-                instant_alarm_mode: document.getElementById('instantAlarm').checked
-            };
-            
-            fetch('/api/update_settings', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(data)
-            })
-            .then(response => response.json())
-            .then(data => {
-                showNotification(data.message, data.success ? 'success' : 'danger');
-                if (data.success) setTimeout(() => location.reload(), 1000);
-            });
-        }
-
-        function saveSchedules() {
-            const schedules = {
-                weekday: {
-                    morning: {
-                        start: document.getElementById('weekday_morning_start').value,
-                        end: document.getElementById('weekday_morning_end').value
-                    },
-                    afternoon: {
-                        start: document.getElementById('weekday_afternoon_start').value,
-                        end: document.getElementById('weekday_afternoon_end').value
-                    },
-                    evening: {
-                        start: document.getElementById('weekday_evening_start').value,
-                        end: document.getElementById('weekday_evening_end').value
-                    }
-                },
-                weekend: {
-                    morning: {
-                        start: document.getElementById('weekend_morning_start').value,
-                        end: document.getElementById('weekend_morning_end').value
-                    },
-                    afternoon: {
-                        start: document.getElementById('weekend_afternoon_start').value,
-                        end: document.getElementById('weekend_afternoon_end').value
-                    },
-                    evening: {
-                        start: document.getElementById('weekend_evening_start').value,
-                        end: document.getElementById('weekend_evening_end').value
-                    }
-                }
-            };
-
-            fetch('/api/save_schedules', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(schedules)
-            })
-            .then(response => response.json())
-            .then(data => {
-                showNotification(data.message, data.success ? 'success' : 'danger');
-            });
-        }
-
-        function addUser(event) {
-            event.preventDefault();
-            const data = {
-                username: document.getElementById('newUsername').value,
-                password: document.getElementById('newPassword').value,
-                email: document.getElementById('newEmail').value,
-                department: document.getElementById('newDepartment').value,
-                role: document.getElementById('newRole').value
-            };
-
-            fetch('/api/add_user', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(data)
-            })
-            .then(response => response.json())
-            .then(data => {
-                showNotification(data.message, data.success ? 'success' : 'danger');
-                if (data.success) {
-                    document.getElementById('addUserModal').querySelector('.btn-close').click();
-                    setTimeout(() => location.reload(), 1000);
-                }
-            });
-        }
-
-        function deleteUser(userId) {
-            if (confirm('Are you sure you want to permanently delete this user account?')) {
-                fetch(`/api/delete_user/${userId}`, { method: 'DELETE' })
-                    .then(response => response.json())
-                    .then(data => {
-                        showNotification(data.message, data.success ? 'success' : 'danger');
-                        if (data.success) setTimeout(() => location.reload(), 1000);
-                    });
             }
         }
-
-        function exportData(event) {
-            event.preventDefault();
-            const format = document.getElementById('exportFormat').value;
-            const dateFrom = document.getElementById('dateFrom').value;
-            const dateTo = document.getElementById('dateTo').value;
+        
+        // Update timer duration
+        function updateTimer() {
+            const duration = parseInt(document.getElementById('timerDuration').value);
+            if (duration < 1 || duration > 86400) {
+                showNotification('Timer duration must be between 1 second and 24 hours', 'danger');
+                return;
+            }
             
-            const params = new URLSearchParams({ format, date_from: dateFrom, date_to: dateTo });
-            window.open(`/api/export?${params}`);
-            
-            showNotification('Report generation started...', 'info');
-        }
-
-        function createBackup() {
-            fetch('/api/backup', { method: 'POST' })
-                .then(response => response.json())
-                .then(data => {
-                    showNotification(data.message, data.success ? 'success' : 'danger');
-                    if (data.success && data.file) {
-                        setTimeout(() => {
-                            window.open(`/api/download_backup?file=${data.file}`);
-                        }, 1000);
-                    }
-                });
-        }
-
-        function refreshEvents() {
-            showNotification('Refreshing event log...', 'info');
-            setTimeout(() => location.reload(), 500);
+            fetch('/api/update_timer', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ duration: duration })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    showNotification('Timer updated successfully', 'success');
+                    document.getElementById('lastUpdated').textContent = new Date().toLocaleString();
+                    updateStatus();
+                    loadEvents();
+                } else {
+                    showNotification(data.message || 'Update failed', 'danger');
+                }
+            })
+            .catch(error => {
+                console.error('Timer update error:', error);
+                showNotification('Update failed - connection error', 'danger');
+            });
         }
         
-        // Enhanced notification system
-        function showNotification(message, type) {
-            const alertDiv = document.createElement('div');
-            alertDiv.className = `alert alert-${type} alert-modern alert-dismissible fade show position-fixed`;
-            alertDiv.style.cssText = 'top: 20px; right: 20px; z-index: 9999; min-width: 300px;';
-            alertDiv.innerHTML = `
-                <i class="fas fa-info-circle me-2"></i>${message}
-                <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
-            `;
-            document.body.appendChild(alertDiv);
-            
-            setTimeout(() => {
-                if (alertDiv.parentNode) {
-                    alertDiv.remove();
-                }
-            }, 5000);
+        // Download report
+        function downloadReport() {
+            showNotification('Generating report...', 'info');
+            window.location.href = '/api/download_report';
         }
+        
+        // Initialize page
+        document.addEventListener('DOMContentLoaded', function() {
+            updateStatus();
+            loadEvents();
+            
+            // Set up regular updates with reduced frequency to prevent scroll issues
+            setInterval(updateStatus, 3000);  // Every 3 seconds instead of 1
+            setInterval(loadEvents, 10000);   // Every 10 seconds for events
+            
+            // Handle tab switching without page scroll
+            const tabLinks = document.querySelectorAll('[data-bs-toggle="pill"]');
+            tabLinks.forEach(link => {
+                link.addEventListener('shown.bs.tab', function(e) {
+                    // Prevent any automatic scrolling on tab change
+                    e.preventDefault();
+                    window.scrollTo(0, 0);
+                });
+            });
+        });
     </script>
 </body>
 </html>
@@ -1510,113 +1174,60 @@ LOGIN_TEMPLATE = '''
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Secure Access - Door Monitor</title>
+    <title>Door Monitor - Login</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
-        :root {
-            --primary-color: #1e293b;
-            --accent-color: #3b82f6;
-            --card-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
-        }
-        
-        * { font-family: 'Inter', sans-serif; }
-        
         body {
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             min-height: 100vh;
             display: flex;
             align-items: center;
-            justify-content: center;
         }
-        
         .login-card {
-            background: rgba(255, 255, 255, 0.95);
             backdrop-filter: blur(10px);
-            border-radius: 20px;
-            box-shadow: var(--card-shadow);
-            border: none;
-            overflow: hidden;
-        }
-        
-        .login-header {
-            background: linear-gradient(90deg, var(--primary-color), #334155);
-            color: white;
-            text-align: center;
-            padding: 2rem;
-        }
-        
-        .form-control-modern {
-            border-radius: 12px;
-            border: 2px solid #e5e7eb;
-            padding: 14px 18px;
-            font-size: 1rem;
-            transition: all 0.3s ease;
-        }
-        
-        .form-control-modern:focus {
-            border-color: var(--accent-color);
-            box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
-        }
-        
-        .btn-modern {
-            border-radius: 12px;
-            padding: 14px 24px;
-            font-weight: 600;
-            border: none;
-            transition: all 0.3s ease;
-        }
-        
-        .btn-modern:hover {
-            transform: translateY(-1px);
-            box-shadow: var(--card-shadow);
+            background: rgba(255,255,255,0.1);
+            border: 1px solid rgba(255,255,255,0.2);
+            border-radius: 15px;
+            box-shadow: 0 8px 30px rgba(0,0,0,0.3);
         }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="row justify-content-center">
-            <div class="col-md-6 col-lg-4">
+            <div class="col-md-6">
                 <div class="card login-card">
-                    <div class="login-header">
-                        <i class="fas fa-shield-alt fa-3x mb-3" style="color: var(--accent-color);"></i>
-                        <h3 class="fw-bold mb-2">Advanced Door Security</h3>
-                        <p class="mb-0 opacity-75">Secure Authentication Required</p>
-                    </div>
-                    <div class="card-body p-4">
-                        {% with messages = get_flashed_messages() %}
-                            {% if messages %}
-                                {% for message in messages %}
-                                    <div class="alert alert-danger" role="alert" style="border-radius: 12px;">
-                                        <i class="fas fa-exclamation-triangle me-2"></i>{{ message }}
-                                    </div>
-                                {% endfor %}
-                            {% endif %}
-                        {% endwith %}
+                    <div class="card-body p-5">
+                        <div class="text-center mb-4">
+                            <i class="fas fa-shield-alt fa-3x text-white mb-3"></i>
+                            <h2 class="text-white">Door Security Monitor</h2>
+                            <p class="text-white-50">Secure Access Required</p>
+                        </div>
+                        
+                        {% if error %}
+                        <div class="alert alert-danger">{{ error }}</div>
+                        {% endif %}
                         
                         <form method="POST">
-                            <div class="mb-4">
-                                <label for="username" class="form-label fw-semibold">
-                                    <i class="fas fa-user me-2"></i>Username
-                                </label>
-                                <input type="text" class="form-control form-control-modern" id="username" name="username" required>
+                            <div class="mb-3">
+                                <label for="username" class="form-label text-white">Username</label>
+                                <input type="text" class="form-control" id="username" name="username" required>
                             </div>
-                            <div class="mb-4">
-                                <label for="password" class="form-label fw-semibold">
-                                    <i class="fas fa-lock me-2"></i>Password
-                                </label>
-                                <input type="password" class="form-control form-control-modern" id="password" name="password" required>
+                            <div class="mb-3">
+                                <label for="password" class="form-label text-white">Password</label>
+                                <input type="password" class="form-control" id="password" name="password" required>
                             </div>
-                            <div class="d-grid">
-                                <button type="submit" class="btn btn-primary btn-modern">
-                                    <i class="fas fa-shield-alt me-2"></i> Secure Access
-                                </button>
-                            </div>
+                            <button type="submit" class="btn btn-light w-100 fw-bold">
+                                <i class="fas fa-sign-in-alt me-2"></i>Login
+                            </button>
                         </form>
-                    </div>
-                    <div class="card-footer text-center text-muted p-3" style="background: #f8fafc;">
-                        <small><i class="fas fa-info-circle me-1"></i>Default: admin / admin123</small>
+                        
+                        <div class="text-center mt-4">
+                            <small class="text-white-50">
+                                Default: admin / admin123
+                            </small>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -1626,314 +1237,14 @@ LOGIN_TEMPLATE = '''
 </html>
 '''
 
-# Flask Routes
-@app.route('/')
-def index():
-    if not session.get('user_id'):
-        return render_template_string(MAIN_TEMPLATE)
-    
-    status = monitor.get_system_status()
-    events = monitor.get_events(limit=15)
-    schedules = monitor.schedules
-    
-    # Get users for admin
-    users = []
-    if session.get('role') == 'Admin':
-        try:
-            conn = sqlite3.connect(Config.DATABASE)
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM users ORDER BY username")
-            users = cursor.fetchall()
-            conn.close()
-        except Exception as e:
-            print(f"Error getting users: {e}")
-    
-    return render_template_string(MAIN_TEMPLATE, 
-                                 status=status, 
-                                 events=events, 
-                                 schedules=schedules,
-                                 users=users)
-
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    if request.method == 'POST':
-        username = request.form['username']
-        password = request.form['password']
-        
-        try:
-            conn = sqlite3.connect(Config.DATABASE)
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM users WHERE username = ?", (username,))
-            user = cursor.fetchone()
-            conn.close()
-            
-            if user and check_password_hash(user[2], password):
-                session['user_id'] = user[0]
-                session['username'] = user[1]
-                session['role'] = user[7]
-                
-                monitor.log_event('LOGIN', f'User {username} logged in successfully', user[0], 'INFO')
-                flash(f'Welcome to the Advanced Security System, {username}!')
-                return redirect(url_for('index'))
-            else:
-                monitor.log_event('LOGIN_FAILED', f'Failed login attempt for username: {username}', severity='WARNING')
-                flash('Invalid credentials. Access denied.')
-                
-        except Exception as e:
-            flash(f'Authentication error: {e}')
-    
-    return render_template_string(LOGIN_TEMPLATE)
-
-@app.route('/logout')
-def logout():
-    if session.get('user_id'):
-        monitor.log_event('LOGOUT', f'User {session.get("username")} logged out', session.get('user_id'), 'INFO')
-    
-    session.clear()
-    flash('You have been securely logged out')
-    return redirect(url_for('login'))
-
-# Enhanced API Routes with comprehensive logging
-@app.route('/api/status')
-def api_status():
-    return jsonify(monitor.get_system_status())
-
-@app.route('/api/reset_alarm', methods=['POST'])
-def api_reset_alarm():
-    if not session.get('user_id'):
-        return jsonify({'success': False, 'message': 'Authentication required'})
-    
-    monitor.reset_alarm()
-    monitor.log_event('ALARM_RESET', f'Alarm manually reset by {session.get("username")}', session.get('user_id'), 'INFO')
-    return jsonify({'success': True, 'message': 'Security system reset successfully'})
-
-@app.route('/api/test_alarm', methods=['POST'])
-def api_test_alarm():
-    if not session.get('user_id'):
-        return jsonify({'success': False, 'message': 'Authentication required'})
-    
-    monitor.play_alarm_sound()
-    monitor.log_event('TEST_ALARM', f'Audio alarm test by {session.get("username")}', session.get('user_id'), 'INFO')
-    return jsonify({'success': True, 'message': 'Audio alarm test completed'})
-
-@app.route('/api/test_leds', methods=['POST'])
-def api_test_leds():
-    if not session.get('user_id'):
-        return jsonify({'success': False, 'message': 'Authentication required'})
-    
-    if GPIO_AVAILABLE:
-        # Flash all LEDs
-        monitor.red_led.on()
-        monitor.white_led.on()
-        time.sleep(1)
-        monitor.red_led.off()
-        monitor.white_led.off()
-    
-    monitor.log_event('TEST_LEDS', f'LED diagnostics test by {session.get("username")}', session.get('user_id'), 'INFO')
-    return jsonify({'success': True, 'message': 'LED diagnostic test completed'})
-
-@app.route('/api/update_settings', methods=['POST'])
-def api_update_settings():
-    if not session.get('user_id'):
-        return jsonify({'success': False, 'message': 'Authentication required'})
-    
-    data = request.get_json()
-    
-    try:
-        old_timer = monitor.state.timer_duration
-        old_instant = monitor.state.instant_alarm_mode
-        
-        monitor.state.timer_duration = int(data.get('timer_duration', 30))
-        monitor.state.instant_alarm_mode = bool(data.get('instant_alarm_mode', False))
-        monitor.save_state()
-        
-        monitor.log_event('SETTINGS_UPDATE', 
-                         f'Settings updated by {session.get("username")}: Timer {old_timer}s→{monitor.state.timer_duration}s, Instant mode {old_instant}→{monitor.state.instant_alarm_mode}', 
-                         session.get('user_id'), 'INFO')
-        return jsonify({'success': True, 'message': 'Security configuration updated successfully'})
-    except Exception as e:
-        return jsonify({'success': False, 'message': f'Configuration error: {e}'})
-
-@app.route('/api/save_schedules', methods=['POST'])
-def api_save_schedules():
-    if not session.get('user_id'):
-        return jsonify({'success': False, 'message': 'Authentication required'})
-    
-    data = request.get_json()
-    
-    try:
-        monitor.schedules = data
-        monitor.save_schedules()
-        
-        monitor.log_event('SCHEDULE_UPDATE', f'Access schedules updated by {session.get("username")}', session.get('user_id'), 'INFO')
-        return jsonify({'success': True, 'message': 'Access schedules updated successfully'})
-    except Exception as e:
-        return jsonify({'success': False, 'message': f'Schedule update error: {e}'})
-
-@app.route('/api/add_user', methods=['POST'])
-def api_add_user():
-    if session.get('role') != 'Admin':
-        return jsonify({'success': False, 'message': 'Administrator privileges required'})
-    
-    data = request.get_json()
-    
-    try:
-        conn = sqlite3.connect(Config.DATABASE)
-        cursor = conn.cursor()
-        
-        password_hash = generate_password_hash(data['password'])
-        cursor.execute('''
-            INSERT INTO users (username, password_hash, email, department, role)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (data['username'], password_hash, data.get('email'), 
-              data.get('department'), data.get('role', 'User')))
-        
-        conn.commit()
-        conn.close()
-        
-        monitor.log_event('USER_CREATE', f'New user account created: {data["username"]} ({data.get("role", "User")}) by {session.get("username")}', session.get('user_id'), 'INFO')
-        return jsonify({'success': True, 'message': f'User account {data["username"]} created successfully'})
-        
-    except sqlite3.IntegrityError:
-        return jsonify({'success': False, 'message': 'Username already exists in the system'})
-    except Exception as e:
-        return jsonify({'success': False, 'message': f'User creation error: {e}'})
-
-@app.route('/api/delete_user/<int:user_id>', methods=['DELETE'])
-def api_delete_user(user_id):
-    if session.get('role') != 'Admin':
-        return jsonify({'success': False, 'message': 'Administrator privileges required'})
-    
-    try:
-        conn = sqlite3.connect(Config.DATABASE)
-        cursor = conn.cursor()
-        
-        # Get username first
-        cursor.execute("SELECT username FROM users WHERE id = ?", (user_id,))
-        user = cursor.fetchone()
-        
-        if user:
-            cursor.execute("DELETE FROM users WHERE id = ?", (user_id,))
-            conn.commit()
-            
-            monitor.log_event('USER_DELETE', f'User account deleted: {user[0]} by {session.get("username")}', session.get('user_id'), 'WARNING')
-            message = f'User account {user[0]} deleted successfully'
-            success = True
-        else:
-            message = 'User account not found'
-            success = False
-            
-        conn.close()
-        return jsonify({'success': success, 'message': message})
-        
-    except Exception as e:
-        return jsonify({'success': False, 'message': f'User deletion error: {e}'})
-
-@app.route('/api/export')
-def api_export():
-    if not session.get('user_id'):
-        return jsonify({'success': False, 'message': 'Authentication required'})
-    
-    format_type = request.args.get('format', 'csv')
-    date_from = request.args.get('date_from')
-    date_to = request.args.get('date_to')
-    
-    try:
-        conn = sqlite3.connect(Config.DATABASE)
-        cursor = conn.cursor()
-        
-        query = '''
-            SELECT e.timestamp, e.event_type, e.description, u.username, e.door_id, e.severity
-            FROM events e 
-            LEFT JOIN users u ON e.user_id = u.id
-            ORDER BY e.timestamp DESC
-        '''
-        
-        cursor.execute(query)
-        events = cursor.fetchall()
-        conn.close()
-        
-        if format_type == 'csv':
-            output = io.StringIO()
-            writer = csv.writer(output)
-            writer.writerow(['Timestamp', 'Event Type', 'Description', 'User', 'Door ID', 'Severity'])
-            writer.writerows(events)
-            
-            filename = f'security_events_{datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
-            
-            monitor.log_event('REPORT_EXPORT', f'Security events exported to CSV by {session.get("username")}', session.get('user_id'), 'INFO')
-            
-            return send_file(
-                io.BytesIO(output.getvalue().encode()),
-                mimetype='text/csv',
-                as_attachment=True,
-                download_name=filename
-            )
-            
-        else:  # PDF format would require additional implementation
-            return jsonify({'success': False, 'message': 'PDF export feature coming soon'})
-            
-    except Exception as e:
-        return jsonify({'success': False, 'message': f'Export error: {e}'})
-
-@app.route('/api/backup', methods=['POST'])
-def api_backup():
-    if session.get('role') != 'Admin':
-        return jsonify({'success': False, 'message': 'Administrator privileges required'})
-    
-    try:
-        # Create backup directory if not exists
-        os.makedirs(Config.BACKUP_DIR, exist_ok=True)
-        
-        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-        backup_filename = f'security_backup_{timestamp}.zip'
-        backup_path = os.path.join(Config.BACKUP_DIR, backup_filename)
-        
-        with zipfile.ZipFile(backup_path, 'w') as backup_zip:
-            # Add database
-            if os.path.exists(Config.DATABASE):
-                backup_zip.write(Config.DATABASE)
-            
-            # Add state files
-            if os.path.exists('system_state.json'):
-                backup_zip.write('system_state.json')
-            if os.path.exists('schedules.json'):
-                backup_zip.write('schedules.json')
-        
-        monitor.log_event('BACKUP_CREATE', f'System backup created: {backup_filename} by {session.get("username")}', session.get('user_id'), 'INFO')
-        return jsonify({'success': True, 'message': 'Secure backup created successfully', 'file': backup_filename})
-        
-    except Exception as e:
-        return jsonify({'success': False, 'message': f'Backup error: {e}'})
-
-@app.route('/api/download_backup')
-def api_download_backup():
-    if session.get('role') != 'Admin':
-        return jsonify({'success': False, 'message': 'Administrator privileges required'})
-    
-    filename = request.args.get('file')
-    if not filename:
-        return jsonify({'success': False, 'message': 'No backup file specified'})
-    
-    backup_path = os.path.join(Config.BACKUP_DIR, filename)
-    if os.path.exists(backup_path):
-        monitor.log_event('BACKUP_DOWNLOAD', f'Backup downloaded: {filename} by {session.get("username")}', session.get('user_id'), 'INFO')
-        return send_file(backup_path, as_attachment=True)
-    else:
-        return jsonify({'success': False, 'message': 'Backup file not found'})
-
 if __name__ == '__main__':
-    print("🚀 Starting Advanced Door Monitoring System...")
-    print("🔧 GPIO Available:" if GPIO_AVAILABLE else "⚠️  Running in simulation mode - GPIO not available")
-    print("🔊 Audio Available:" if AUDIO_AVAILABLE else "⚠️  Audio not available - install pygame for sound alerts")
-    print("🔐 Default login: admin / admin123")
-    print("🌐 Access dashboard at: http://[raspberry-pi-ip]:5000")
+    init_db()
+    if GPIO_AVAILABLE:
+        monitor_door()
     
-    # Create necessary directories
-    os.makedirs(Config.BACKUP_DIR, exist_ok=True)
+    print("🚀 Door Monitoring System Starting...")
+    print(f"🌐 Web Interface: http://localhost:5000")
+    print(f"🔧 GPIO Mode: {'Hardware' if GPIO_AVAILABLE else 'Simulation'}")
+    print("🔐 Default Login: admin / admin123")
     
-    # Log system startup
-    monitor.log_event('SYSTEM_START', 'Advanced Door Monitoring System started', severity='INFO')
-    
-    # Run Flask app
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
